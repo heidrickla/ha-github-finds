@@ -124,6 +124,75 @@ pub fn upsert(links: &mut Vec<Link>, link: Link) -> bool {
     replaced
 }
 
+/// Remove the link with this url; whether one was there.
+pub fn remove(links: &mut Vec<Link>, url: &str) -> bool {
+    let before = links.len();
+    links.retain(|l| l.url != url);
+    links.len() != before
+}
+
+/// Owner and repository from a github.com url, trailing slash ignored.
+pub fn owner_repo(url: &str) -> Option<(String, String)> {
+    let mut parts = url.strip_prefix(GITHUB)?.trim_end_matches('/').split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// A link from the GitHub API's repository object; tags given win over the first four topics.
+pub fn from_repo(
+    url: &str,
+    why: &str,
+    tags: Option<Vec<String>>,
+    meta: &Value,
+    added: &str,
+) -> Link {
+    let topics = || {
+        meta["topics"]
+            .as_array()
+            .map(|t| {
+                t.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Link {
+        url: url.trim_end_matches('/').to_string(),
+        title: meta["full_name"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| owner_repo(url).map(|(o, r)| format!("{o}/{r}")))
+            .unwrap_or_default(),
+        summary: meta["description"]
+            .as_str()
+            .map(|s| s.chars().take(500).collect()),
+        why: why.to_string(),
+        tags: tags.unwrap_or_else(topics),
+        added: added.to_string(),
+        stars: meta["stargazers_count"].as_u64(),
+        language: meta["language"].as_str().map(String::from),
+        pushed: meta["pushed_at"]
+            .as_str()
+            .map(|s| s.chars().take(10).collect()),
+    }
+}
+
+/// YYYY-MM-DD for a count of days since 1970-01-01 (Howard Hinnant's civil_from_days).
+pub fn date_from_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// What the server answers: status, content type, body.
 pub struct Reply {
     pub status: u16,
@@ -262,7 +331,149 @@ mod tests {
     }
 
     #[test]
+    fn each_limit_holds_at_its_edge() {
+        let ok = link("https://github.com/o/r", "2026-10-01");
+        let mut l = ok.clone();
+        l.url = format!("https://github.com/{}", "a".repeat(300 - GITHUB.len()));
+        assert_eq!(refuse(&l), None);
+        l.url.push('a');
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.title = "t".repeat(120);
+        assert_eq!(refuse(&l), None);
+        l.title.push('t');
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.title = "  ".into();
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.why = "w".repeat(500);
+        assert_eq!(refuse(&l), None);
+        l.why.push('w');
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.summary = Some("s".repeat(500));
+        assert_eq!(refuse(&l), None);
+        l.summary = Some("s".repeat(501));
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.tags = (0..8).map(|i| format!("t{i}")).collect();
+        assert_eq!(refuse(&l), None);
+        l.tags = vec!["a".repeat(30)];
+        assert_eq!(refuse(&l), None);
+        l.tags = vec!["a".repeat(31)];
+        assert!(refuse(&l).is_some());
+        l.tags = vec![String::new()];
+        assert!(refuse(&l).is_some());
+        let mut l = ok.clone();
+        l.language = Some("l".repeat(40));
+        assert_eq!(refuse(&l), None);
+        l.language = Some("l".repeat(41));
+        assert!(refuse(&l).is_some());
+    }
+
+    #[test]
+    fn a_date_needs_both_dashes_and_digits_elsewhere() {
+        for bad in [
+            "2026x10-01",
+            "2026-10x01",
+            "2026-1a-01",
+            "2026-10-1",
+            "2026-10-011",
+        ] {
+            let l = link("https://github.com/o/r", bad);
+            assert!(refuse(&l).is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dates_from_days() {
+        assert_eq!(date_from_days(0), "1970-01-01");
+        assert_eq!(date_from_days(59), "1970-03-01");
+        assert_eq!(date_from_days(10_957), "2000-01-01");
+        assert_eq!(date_from_days(11_016), "2000-02-29");
+        assert_eq!(date_from_days(11_017), "2000-03-01");
+        assert_eq!(date_from_days(20_727), "2026-10-01");
+        assert_eq!(date_from_days(20_819), "2027-01-01");
+        assert_eq!(date_from_days(-1), "1969-12-31");
+    }
+
+    #[test]
+    fn owner_and_repo_from_a_url() {
+        assert_eq!(
+            owner_repo("https://github.com/o/r/"),
+            Some(("o".into(), "r".into()))
+        );
+        assert_eq!(
+            owner_repo("https://github.com/o/r/tree/main"),
+            Some(("o".into(), "r".into()))
+        );
+        assert_eq!(owner_repo("https://github.com/o"), None);
+        assert_eq!(owner_repo("https://github.com//r"), None);
+        assert_eq!(owner_repo("https://gitlab.com/o/r"), None);
+    }
+
+    #[test]
+    fn a_link_from_the_api() {
+        let meta = serde_json::json!({
+            "full_name": "Owner/Repo", "description": "d".repeat(600), "stargazers_count": 42,
+            "language": "Rust", "pushed_at": "2026-09-30T12:00:00Z", "topics": ["a", "b", "c", "d", "e"]
+        });
+        let l = from_repo(
+            "https://github.com/Owner/Repo/",
+            "w",
+            None,
+            &meta,
+            "2026-10-01",
+        );
+        assert_eq!(l.url, "https://github.com/Owner/Repo");
+        assert_eq!(l.title, "Owner/Repo");
+        assert_eq!(l.summary.as_ref().map(|s| s.len()), Some(500));
+        assert_eq!(l.tags, ["a", "b", "c", "d"]);
+        assert_eq!(
+            (l.stars, l.language.as_deref(), l.pushed.as_deref()),
+            (Some(42), Some("Rust"), Some("2026-09-30"))
+        );
+        let given = from_repo(
+            "https://github.com/o/r",
+            "w",
+            Some(vec!["x".into()]),
+            &serde_json::json!({}),
+            "2026-10-01",
+        );
+        assert_eq!(
+            (given.title.as_str(), given.tags.as_slice()),
+            ("o/r", ["x".to_string()].as_slice())
+        );
+        assert_eq!(given.summary, None);
+    }
+
+    #[test]
+    fn remove_by_url() {
+        let mut links = vec![
+            link("https://github.com/a/b", "2026-09-01"),
+            link("https://github.com/a/c", "2026-10-01"),
+        ];
+        assert!(!remove(&mut links, "https://github.com/a/x"));
+        assert!(remove(&mut links, "https://github.com/a/b"));
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            ["https://github.com/a/c"]
+        );
+    }
+
+    #[test]
     fn routes() {
+        assert_eq!(
+            respond("/app.js", None).content_type,
+            "text/javascript; charset=utf-8"
+        );
+        assert!(respond("/app.js", None).body.contains("links.json"));
+        assert_eq!(
+            respond("/style.css", None).content_type,
+            "text/css; charset=utf-8"
+        );
+        assert!(respond("/style.css", None).body.contains("--bg"));
         assert_eq!(respond("/", None).status, 200);
         assert!(respond("/", None).body.contains("<html"));
         assert_eq!(respond("/healthz", None).body, "ok");
