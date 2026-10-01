@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Finds</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><h1>GitHub Finds</h1><span class="tagline">projects picked for you</span></div>
+  <div class="controls">
+    <input id="filter" type="search" placeholder="Filter" autocomplete="off" aria-label="Filter">
+    <button id="theme" type="button" aria-label="Toggle theme">Light</button>
+  </div>
+</header>
+<nav id="tags" aria-label="Tags"></nav>
+<main id="list" aria-live="polite"></main>
+<footer id="foot"></footer>
+<script src="app.js"></script>
+</body>
+</html>

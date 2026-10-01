@@ -1,0 +1,25 @@
+name: GitHub Finds
+version: "0.1.0"
+slug: github_finds
+description: GitHub projects picked for you, on one page
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+stage: stable
+advanced: false
+ports:
+  8091/tcp: 8091
+ports_description:
+  8091/tcp: The page over plain HTTP on the LAN
+ingress: true
+ingress_port: 8091
+panel_icon: mdi:github
+panel_title: Finds
+map:
+  - type: addon_config
+    read_only: true
+watchdog: http://[HOST]:[PORT:8091]/healthz
+options: {}
+schema: {}

@@ -1,0 +1,32 @@
+:root, [data-theme="dark"] {
+  --bg: #0f1115; --card: #171a21; --line: #262b36; --text: #e6e8ec; --muted: #9aa3b2;
+  --accent: #6ea8fe; --chip: #222733; --new: #3fb950;
+}
+[data-theme="light"] {
+  --bg: #f6f7f9; --card: #ffffff; --line: #e1e4e8; --text: #1f2328; --muted: #59636e;
+  --accent: #0969da; --chip: #eef1f4; --new: #1a7f37;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 16px; border-bottom: 1px solid var(--line); }
+h1 { margin: 0; font-size: 20px; }
+.tagline { color: var(--muted); font-size: 13px; }
+.controls { display: flex; gap: 8px; flex: 1 1 260px; justify-content: flex-end; }
+input[type="search"] { flex: 1 1 auto; max-width: 320px; min-width: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); }
+button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); cursor: pointer; }
+nav { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 16px 0; }
+.chip { padding: 2px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); border: 1px solid var(--line); font-size: 13px; cursor: pointer; }
+.chip.on { color: var(--text); border-color: var(--accent); }
+main { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 16px; }
+article { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+article a.title { color: var(--accent); font-weight: 600; text-decoration: none; overflow-wrap: anywhere; }
+article a.title:hover { text-decoration: underline; }
+.why { margin: 0; }
+.summary { margin: 0; color: var(--muted); font-size: 14px; }
+.meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 10px; }
+.new { color: var(--new); font-weight: 600; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tags span { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+footer { padding: 0 16px 24px; color: var(--muted); font-size: 13px; }
+.empty { color: var(--muted); padding: 24px 0; }
+@media (max-width: 480px) { main { grid-template-columns: 1fr; padding: 12px; } header { padding: 12px; } }
