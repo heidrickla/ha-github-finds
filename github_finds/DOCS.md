@@ -41,4 +41,4 @@ github-finds list
 github-finds remove https://github.com/owner/repo
 ```
 
-Defaults: `--host claude@192.0.2.10`, `--ssh-port 2222` (the Advanced SSH add-on, whose user has `sudo`), `--key ~/.ssh/ha_ed25519`. Without `--tags` the first four GitHub topics are used.
+Defaults: `--host root@192.0.2.10`, `--ssh-port 22` (the Advanced SSH add-on), `--key ~/.ssh/ha_ed25519`. Without `--tags` the first four GitHub topics are used.

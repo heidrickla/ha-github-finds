@@ -13,7 +13,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 const USAGE: &str = "usage:
   github-finds serve [--links /config/links.json] [--port 8091]
-  github-finds add <github url> --why <text> [--tags a,b] [--host claude@192.0.2.10] [--ssh-port 2222] [--key ~/.ssh/ha_ed25519]
+  github-finds add <github url> --why <text> [--tags a,b] [--host root@192.0.2.10] [--ssh-port 22] [--key ~/.ssh/ha_ed25519]
   github-finds list | remove <github url>   (same --host, --ssh-port, --key)";
 const DIR: &str = "/addon_configs/local_github_finds";
 
@@ -102,8 +102,8 @@ impl Remote {
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_default();
         Remote {
-            host: flag(args, "--host").unwrap_or_else(|| "claude@192.0.2.10".into()),
-            port: flag(args, "--ssh-port").unwrap_or_else(|| "2222".into()),
+            host: flag(args, "--host").unwrap_or_else(|| "root@192.0.2.10".into()),
+            port: flag(args, "--ssh-port").unwrap_or_else(|| "22".into()),
             key: flag(args, "--key").unwrap_or_else(|| format!("{home}/.ssh/ha_ed25519")),
         }
     }
