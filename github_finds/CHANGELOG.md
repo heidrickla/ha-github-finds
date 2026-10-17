@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- A find's tags are its topics that match a search topic or a tag in the list, filled to two from its other topics.
+- One pick per owner a day; the others are judged again the next day.
+- `discover` errors and the HTTP status mapping live in the library.
+
 ## 0.2.0
 
 - Daily discovery: a GitHub search per topic for licensed, active projects created in the last 90 days, each new one judged by a local model through the Voice Bridge router, and up to `per_day` picks added with the model's reason as `why`.

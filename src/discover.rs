@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -320,24 +321,41 @@ pub fn verdict(reply: &Value) -> Result<Verdict, String> {
     Ok(Verdict { pick, score, why })
 }
 
-/// A find's tags: the first four GitHub topics that pass the list's tag rule.
-pub fn tags(meta: &Value) -> Vec<String> {
-    meta["topics"]
+fn valid_tag(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 30
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A find's tags: its GitHub topics found in `vocab` (the search topics and the list's tags), up
+/// to four; when fewer than two match, other topics fill to two. GitHub sorts topics
+/// alphabetically, so the first few are often project codenames.
+pub fn tags(meta: &Value, vocab: &BTreeSet<String>) -> Vec<String> {
+    let topics: Vec<&str> = meta["topics"]
         .as_array()
         .map(|t| {
             t.iter()
                 .filter_map(Value::as_str)
-                .filter(|t| {
-                    !t.is_empty()
-                        && t.len() <= 30
-                        && t.chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                })
-                .take(4)
-                .map(String::from)
+                .filter(|t| valid_tag(t))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mut out: Vec<String> = topics
+        .iter()
+        .filter(|t| vocab.contains(**t))
+        .take(4)
+        .map(|t| t.to_string())
+        .collect();
+    for t in topics {
+        if out.len() >= 2 {
+            break;
+        }
+        if !out.iter().any(|o| o.as_str() == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// What one run did.
@@ -472,14 +490,26 @@ pub fn run(net: &dyn Net, opts: &Options, links: &[Link], state: &mut State, now
             .cmp(&va.score)
             .then_with(|| cb.stars().cmp(&ca.stars()))
     });
+    let mut vocab: BTreeSet<String> = opts.topics.iter().cloned().collect();
+    vocab.extend(links.iter().flat_map(|l| l.tags.iter().cloned()));
+    let mut owners: BTreeSet<String> = BTreeSet::new();
     let mut added = Vec::new();
     for (c, v) in picks {
-        if added.len() >= opts.per_day {
-            // A pick past the day's quota is judged again tomorrow.
+        let owner = owner_repo(&c.url)
+            .map(|(o, _)| o.to_lowercase())
+            .unwrap_or_default();
+        if added.len() >= opts.per_day || owners.contains(&owner) {
+            // A pick past the day's quota, or a second from one owner, is judged again tomorrow.
             state.seen.remove(&c.key());
             continue;
         }
-        let link = from_repo(&c.url, &v.why, Some(tags(&c.meta)), &c.meta, &today_date);
+        let link = from_repo(
+            &c.url,
+            &v.why,
+            Some(tags(&c.meta, &vocab)),
+            &c.meta,
+            &today_date,
+        );
         if let Some(why) = refuse(&link) {
             report.notes.push(format!("{}: {why}", link.title));
             continue;
@@ -492,6 +522,7 @@ pub fn run(net: &dyn Net, opts: &Options, links: &[Link], state: &mut State, now
                 summary: link.summary.clone(),
             },
         );
+        owners.insert(owner);
         report.added.push(link.title.clone());
         added.push(link);
     }
@@ -522,6 +553,99 @@ pub fn merge(text: Option<&str>, picks: &[Link]) -> Result<String, String> {
     serde_json::to_string_pretty(&links)
         .map(|s| s + "\n")
         .map_err(|e| e.to_string())
+}
+
+/// An HTTP answer as JSON: 5xx means the far end failed (`Down`), anything else but 200 refused.
+pub fn classify(status: u16, text: &str) -> Result<Value, Fetch> {
+    let head = || text.chars().take(200).collect::<String>();
+    if status >= 500 {
+        return Err(Fetch::Down(format!("HTTP {status}: {}", head())));
+    }
+    if status != 200 {
+        return Err(Fetch::Status(status, head()));
+    }
+    serde_json::from_str(text).map_err(|e| Fetch::Status(status, format!("not JSON: {e}")))
+}
+
+/// Where a run reads the list and options and keeps its state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Paths {
+    pub links: String,
+    pub options: String,
+    pub state: String,
+}
+
+impl Paths {
+    /// The options; a missing file gives the defaults, an unreadable one an error.
+    pub fn options(&self) -> Result<Options, String> {
+        match std::fs::read_to_string(&self.options) {
+            Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{}: {e}", self.options)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Options::default()),
+            Err(e) => Err(format!("{}: {e}", self.options)),
+        }
+    }
+
+    /// The saved state; missing or unreadable starts afresh.
+    pub fn state(&self) -> State {
+        std::fs::read_to_string(&self.state)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Write `text` to `path` through a temporary file beside it.
+pub fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, Path::new(path))
+}
+
+/// One run against the files: search, judge, merge the picks into the list, save the state. A dry
+/// run writes nothing. An error means nothing was written.
+pub fn once(
+    net: &dyn Net,
+    opts: &Options,
+    paths: &Paths,
+    dry: bool,
+    now: u64,
+) -> Result<Run, String> {
+    let mut state = paths.state();
+    let text = std::fs::read_to_string(&paths.links).ok();
+    let (links, notes) = text.as_deref().map(parse).unwrap_or_default();
+    if !notes.is_empty() {
+        return Err(format!(
+            "skipped, {} has entries a rewrite would drop: {notes:?}",
+            paths.links
+        ));
+    }
+    let outcome = run(net, opts, &links, &mut state, now);
+    if dry {
+        return Ok(outcome);
+    }
+    if !outcome.picks.is_empty() {
+        // Read again: the CLI may have changed the file during the run.
+        let current = std::fs::read_to_string(&paths.links).ok();
+        merge(current.as_deref(), &outcome.picks)
+            .and_then(|t| write_atomic(&paths.links, &t).map_err(|e| e.to_string()))
+            .map_err(|e| format!("{} not written, state kept as it was: {e}", paths.links))?;
+    }
+    let saved = serde_json::to_string(&state).map_err(|e| e.to_string());
+    saved
+        .and_then(|t| write_atomic(&paths.state, &t).map_err(|e| e.to_string()))
+        .map_err(|e| {
+            format!(
+                "{} added but state {} not saved: {e}",
+                outcome.picks.len(),
+                paths.state
+            )
+        })?;
+    Ok(outcome)
+}
+
+/// Whether the daily check should start a run now.
+pub fn should_run(opts: &Options, state: &State, now: u64) -> bool {
+    opts.discover && due(state, now)
 }
 
 #[cfg(test)]
@@ -815,13 +939,48 @@ mod tests {
         assert!(verdict(&answer(true, 5, &"w".repeat(WHY_MAX))).is_ok());
     }
 
+    fn vocab(words: &[&str]) -> BTreeSet<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
     #[test]
-    fn tags_keep_the_first_four_valid_topics() {
-        assert_eq!(tags(&repo("o/r", 1)), ["home-assistant", "rust"]);
+    fn tags_take_the_vocabulary_first_and_fill_to_two() {
+        let v = vocab(&["home-assistant", "unifi", "a", "b", "c", "d", "e"]);
+        let codenames = json!({"topics": ["alexa", "checkers", "cronos", "home-assistant"]});
+        assert_eq!(tags(&codenames, &v), ["home-assistant", "alexa"]);
         let many = json!({"topics": ["a", "b", "c", "d", "e", "x".repeat(31)]});
-        assert_eq!(tags(&many), ["a", "b", "c", "d"]);
-        assert!(tags(&json!({})).is_empty());
-        assert_eq!(tags(&json!({"topics": ["x".repeat(30)]})).len(), 1);
+        assert_eq!(tags(&many, &v), ["a", "b", "c", "d"]);
+        let none = json!({"topics": ["p", "q", "r", "Bad Topic", "x".repeat(31)]});
+        assert_eq!(tags(&none, &v), ["p", "q"]);
+        assert_eq!(
+            tags(&json!({"topics": ["unifi", "home-assistant"]}), &v),
+            ["unifi", "home-assistant"]
+        );
+        assert_eq!(tags(&json!({"topics": ["only"]}), &v), ["only"]);
+        assert!(tags(&json!({}), &v).is_empty());
+        assert_eq!(tags(&json!({"topics": ["x".repeat(30)]}), &v).len(), 1);
+    }
+
+    #[test]
+    fn fetch_errors_name_their_kind() {
+        assert_eq!(Fetch::Down("dns".into()).to_string(), "unreachable: dns");
+        assert_eq!(
+            Fetch::Status(403, "limit".into()).to_string(),
+            "HTTP 403: limit"
+        );
+    }
+
+    #[test]
+    fn statuses_classify_as_down_refused_or_json() {
+        assert_eq!(classify(200, r#"{"a": 1}"#), Ok(json!({"a": 1})));
+        assert!(matches!(classify(200, "nope"), Err(Fetch::Status(200, _))));
+        assert!(matches!(classify(500, "x"), Err(Fetch::Down(_))));
+        assert!(matches!(classify(503, "x"), Err(Fetch::Down(_))));
+        assert_eq!(classify(499, "x"), Err(Fetch::Status(499, "x".into())));
+        assert!(matches!(classify(201, "{}"), Err(Fetch::Status(201, _))));
+        assert!(
+            matches!(classify(403, &"y".repeat(500)), Err(Fetch::Status(403, t)) if t.len() == 200)
+        );
     }
 
     #[test]
@@ -829,13 +988,13 @@ mod tests {
         let net = Fake::new()
             .topic(
                 "home-assistant",
-                vec![repo("a/low", 50), repo("a/top", 10), repo("a/mid", 90)],
+                vec![repo("l/low", 50), repo("t/top", 10), repo("m/mid", 90)],
             )
-            .topic("unifi", vec![repo("a/top", 10), repo("a/tie", 200)])
-            .says("a/top", Ok(answer(true, 9, "Voice satellite for HA")))
-            .says("a/mid", Ok(answer(true, 7, "A UniFi API client")))
-            .says("a/tie", Ok(answer(true, 7, "Another UniFi tool")))
-            .says("a/low", Ok(answer(true, 6, "Close but no")));
+            .topic("unifi", vec![repo("t/top", 10), repo("x/tie", 200)])
+            .says("t/top", Ok(answer(true, 9, "Voice satellite for HA")))
+            .says("m/mid", Ok(answer(true, 7, "A UniFi API client")))
+            .says("x/tie", Ok(answer(true, 7, "Another UniFi tool")))
+            .says("l/low", Ok(answer(true, 6, "Close but no")));
         let mut state = State::default();
         let r = run(
             &net,
@@ -847,26 +1006,35 @@ mod tests {
         assert!(r.finished);
         assert_eq!(
             r.picks.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
-            ["a/top", "a/tie"],
+            ["t/top", "x/tie"],
             "score first, then stars"
         );
         assert_eq!(r.picks[0].why, "Voice satellite for HA");
         assert_eq!(r.picks[0].added, "2026-10-17");
         assert_eq!(r.picks[0].tags, ["home-assistant", "rust"]);
-        assert_eq!(*net.asked.borrow(), ["a/low", "a/top", "a/mid", "a/tie"]);
+        assert_eq!(*net.asked.borrow(), ["l/low", "t/top", "m/mid", "x/tie"]);
         assert_eq!(state.last_run, NOW);
-        assert!(state.picked.contains_key("https://github.com/a/top"));
-        assert!(state.seen.contains_key("https://github.com/a/low"));
+        assert!(state.picked.contains_key("https://github.com/t/top"));
+        assert!(state.seen.contains_key("https://github.com/l/low"));
         assert!(
-            !state.seen.contains_key("https://github.com/a/mid"),
+            !state.seen.contains_key("https://github.com/m/mid"),
             "a pick past the quota is judged again"
         );
         assert_eq!(
             (r.report.candidates, r.report.judged, r.report.picked),
             (4, 4, 3)
         );
-        assert_eq!(r.report.added, ["a/top", "a/tie"]);
+        assert_eq!(r.report.added, ["t/top", "x/tie"]);
         assert_eq!(r.report.verdicts.len(), 4);
+        assert_eq!(
+            r.report.verdicts[1],
+            (
+                "t/top".to_string(),
+                true,
+                9,
+                "Voice satellite for HA".to_string()
+            )
+        );
     }
 
     #[test]
@@ -942,6 +1110,192 @@ mod tests {
         let r = run(&down, &opts(&["mcp"], 3), &[], &mut State::default(), NOW);
         assert!(!r.finished);
         assert_eq!(r.report.deferred, 1);
+    }
+
+    #[test]
+    fn a_500_from_the_router_counts_as_down() {
+        let net = Fake::new()
+            .topic("mcp", vec![repo("a/x", 5)])
+            .says("a/x", Err(Fetch::Status(500, "boom".into())));
+        let mut state = State::default();
+        let r = run(&net, &opts(&["mcp"], 3), &[], &mut state, NOW);
+        assert!(!r.finished);
+        assert_eq!(r.report.deferred, 1);
+        assert!(state.seen.is_empty());
+        let net = Fake::new()
+            .topic("mcp", vec![repo("a/x", 5)])
+            .says("a/x", Err(Fetch::Status(499, "no".into())));
+        let r = run(&net, &opts(&["mcp"], 3), &[], &mut State::default(), NOW);
+        assert!(r.finished);
+        assert_eq!(r.report.bad_replies, 1);
+    }
+
+    #[test]
+    fn one_owner_gets_one_pick_a_day() {
+        let net = Fake::new()
+            .topic(
+                "mcp",
+                vec![
+                    repo("same/one", 5),
+                    repo("Same/two", 9),
+                    repo("other/three", 1),
+                ],
+            )
+            .says("same/one", Ok(answer(true, 9, "First")))
+            .says("Same/two", Ok(answer(true, 8, "Second")))
+            .says("other/three", Ok(answer(true, 7, "Third")));
+        let mut state = State::default();
+        let r = run(&net, &opts(&["mcp"], 3), &[], &mut state, NOW);
+        assert_eq!(
+            r.picks.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["same/one", "other/three"]
+        );
+        assert!(
+            !state.seen.contains_key("https://github.com/same/two"),
+            "judged again tomorrow"
+        );
+    }
+
+    #[test]
+    fn picks_are_tagged_from_the_search_topics_and_the_list() {
+        let mut r = repo("o/r", 5);
+        r["topics"] = json!(["aardvark", "beta", "unifi", "zigbee"]);
+        let net = Fake::new()
+            .topic("mcp", vec![r])
+            .says("o/r", Ok(answer(true, 9, "Useful")));
+        let mut o = opts(&["mcp", "zigbee"], 3);
+        o.topics.push("Bad Topic".into());
+        let got = run(
+            &net,
+            &o,
+            &[own("https://github.com/x/y")],
+            &mut State::default(),
+            NOW,
+        );
+        assert_eq!(got.picks[0].tags, ["unifi", "zigbee"]);
+    }
+
+    fn scratch(name: &str) -> Paths {
+        let dir = std::env::temp_dir().join(format!("finds-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = |f: &str| dir.join(f).to_string_lossy().into_owned();
+        Paths {
+            links: at("links.json"),
+            options: at("options.json"),
+            state: at("discover.json"),
+        }
+    }
+
+    #[test]
+    fn once_merges_picks_saves_state_and_a_second_run_skips_them() {
+        let p = scratch("once");
+        std::fs::write(
+            &p.links,
+            serde_json::to_string(&vec![own("https://github.com/o/old")]).unwrap(),
+        )
+        .unwrap();
+        let net = Fake::new()
+            .topic("mcp", vec![repo("n/new", 5)])
+            .says("n/new", Ok(answer(true, 9, "Useful")));
+        let o = opts(&["mcp"], 3);
+        let r = once(&net, &o, &p, false, NOW).unwrap();
+        assert!(r.finished);
+        let (links, notes) = parse(&std::fs::read_to_string(&p.links).unwrap());
+        assert!(notes.is_empty());
+        assert_eq!(
+            links.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["n/new", "o/old"]
+        );
+        let state = p.state();
+        assert_eq!(state.last_run, NOW);
+        assert!(state.picked.contains_key("https://github.com/n/new"));
+        assert!(!Path::new(&format!("{}.tmp", p.links)).exists());
+        let again = once(&net, &o, &p, false, NOW + DAY).unwrap();
+        assert_eq!(again.report.candidates, 0);
+        assert_eq!(net.asked.borrow().len(), 1);
+        assert_eq!(
+            parse(&std::fs::read_to_string(&p.links).unwrap()).0.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing() {
+        let p = scratch("dry");
+        let net = Fake::new()
+            .topic("mcp", vec![repo("n/new", 5)])
+            .says("n/new", Ok(answer(true, 9, "Useful")));
+        let r = once(&net, &opts(&["mcp"], 3), &p, true, NOW).unwrap();
+        assert_eq!(r.picks.len(), 1);
+        assert!(!Path::new(&p.links).exists());
+        assert!(!Path::new(&p.state).exists());
+    }
+
+    #[test]
+    fn a_damaged_list_stops_the_run_before_any_call() {
+        let p = scratch("damaged");
+        let bad = r#"[{"url": "https://example.com/x", "title": "t", "why": "w", "added": "2026-10-01"}]"#;
+        std::fs::write(&p.links, bad).unwrap();
+        let net = Fake::new().topic("mcp", vec![repo("n/new", 5)]);
+        assert!(once(&net, &opts(&["mcp"], 3), &p, false, NOW).is_err());
+        assert!(net.queries.borrow().is_empty());
+        assert_eq!(std::fs::read_to_string(&p.links).unwrap(), bad);
+        assert!(!Path::new(&p.state).exists());
+    }
+
+    #[test]
+    fn a_list_that_cannot_be_written_keeps_the_old_state() {
+        let p = scratch("unwritable");
+        std::fs::create_dir_all(format!("{}.tmp", p.links)).unwrap();
+        let net = Fake::new()
+            .topic("mcp", vec![repo("n/new", 5)])
+            .says("n/new", Ok(answer(true, 9, "Useful")));
+        assert!(once(&net, &opts(&["mcp"], 3), &p, false, NOW).is_err());
+        assert!(!Path::new(&p.state).exists());
+        let none = Fake::new().topic("mcp", vec![repo("n/none", 5)]);
+        let q = scratch("nopicks");
+        let r = once(&none, &opts(&["mcp"], 3), &q, false, NOW).unwrap();
+        assert!(r.picks.is_empty());
+        assert!(!Path::new(&q.links).exists(), "no picks, no list written");
+        assert_eq!(q.state().last_run, NOW);
+    }
+
+    #[test]
+    fn options_and_state_files() {
+        let p = scratch("files");
+        assert_eq!(p.options(), Ok(Options::default()));
+        assert_eq!(p.state(), State::default());
+        std::fs::write(&p.options, r#"{"per_day": 1, "discover": false}"#).unwrap();
+        let o = p.options().unwrap();
+        assert_eq!((o.per_day, o.discover), (1, false));
+        std::fs::write(&p.options, "not json").unwrap();
+        assert!(p.options().is_err());
+        std::fs::write(&p.state, "not json").unwrap();
+        assert_eq!(p.state(), State::default());
+        std::fs::write(&p.state, r#"{"last_run": 5}"#).unwrap();
+        assert_eq!(p.state().last_run, 5);
+        let dir = scratch("dir");
+        std::fs::create_dir_all(&dir.options).unwrap();
+        assert!(
+            dir.options().is_err(),
+            "an unreadable options path is an error, not the defaults"
+        );
+    }
+
+    #[test]
+    fn a_run_is_started_only_when_enabled_and_due() {
+        let mut o = Options::default();
+        let s = State::default();
+        assert!(should_run(&o, &s, NOW));
+        o.discover = false;
+        assert!(!should_run(&o, &s, NOW));
+        o.discover = true;
+        let recent = State {
+            last_run: NOW,
+            ..State::default()
+        };
+        assert!(!should_run(&o, &recent, NOW));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 name: GitHub Finds
-version: "0.2.0"
+version: "0.2.1"
 slug: github_finds
 description: GitHub projects picked for you, on one page
 arch:

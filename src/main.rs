@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use github_finds::discover::{self, Fetch, Net, Options, State};
+use github_finds::discover::{self, Fetch, Net, Options, Paths};
 use github_finds::{
     GITHUB, Link, date_from_days, from_repo, owner_repo, parse, refuse, remove as remove_url,
     respond, upsert,
@@ -62,7 +62,7 @@ fn serve(args: &[String]) -> i32 {
     for note in notes {
         eprintln!("left out: {note}");
     }
-    if let Some(paths) = Paths::from(args, &links) {
+    if let Some(paths) = paths(args, &links) {
         std::thread::spawn(move || discover_loop(&paths));
     }
     let headers = [
@@ -99,49 +99,20 @@ fn serve(args: &[String]) -> i32 {
     0
 }
 
-/// Where discovery reads its options and keeps its state; None without `--options`.
-struct Paths {
-    links: String,
-    options: String,
-    state: String,
+/// Discovery's files; None without `--options`.
+fn paths(args: &[String], links: &str) -> Option<Paths> {
+    Some(Paths {
+        links: links.to_string(),
+        options: flag(args, "--options")?,
+        state: flag(args, "--state").unwrap_or_else(|| "/data/discover.json".into()),
+    })
 }
 
-impl Paths {
-    fn from(args: &[String], links: &str) -> Option<Paths> {
-        Some(Paths {
-            links: links.to_string(),
-            options: flag(args, "--options")?,
-            state: flag(args, "--state").unwrap_or_else(|| "/data/discover.json".into()),
-        })
-    }
-
-    fn options(&self) -> Options {
-        match std::fs::read_to_string(&self.options).map(|t| serde_json::from_str(&t)) {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                eprintln!(
-                    "discover: {} is not valid options, using defaults: {e}",
-                    self.options
-                );
-                Options::default()
-            }
-            Err(_) => Options::default(),
-        }
-    }
-
-    fn state(&self) -> State {
-        std::fs::read_to_string(&self.state)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
-    }
-}
-
-/// Write `text` to `path` through a temporary file in the same directory.
-fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+fn options(paths: &Paths) -> Options {
+    paths.options().unwrap_or_else(|e| {
+        eprintln!("discover: options not valid, using defaults: {e}");
+        Options::default()
+    })
 }
 
 fn epoch() -> u64 {
@@ -181,16 +152,7 @@ fn answer(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Resu
         .body_mut()
         .read_to_string()
         .map_err(|e| Fetch::Down(e.to_string()))?;
-    if status >= 500 {
-        return Err(Fetch::Down(format!(
-            "HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
-        )));
-    }
-    if status != 200 {
-        return Err(Fetch::Status(status, text.chars().take(200).collect()));
-    }
-    serde_json::from_str(&text).map_err(|e| Fetch::Status(status, format!("not JSON: {e}")))
+    discover::classify(status, &text)
 }
 
 impl Net for Http {
@@ -226,52 +188,28 @@ impl Net for Http {
     }
 }
 
-/// One discovery run: search, judge, merge the picks into the file, save the state. Returns
-/// whether the run finished.
+/// One run, logged; whether it finished.
 fn discover_once(net: &dyn Net, paths: &Paths, dry: bool) -> bool {
-    let opts = paths.options();
-    let mut state = paths.state();
-    let text = std::fs::read_to_string(&paths.links).ok();
-    let (links, notes) = text.as_deref().map(parse).unwrap_or_default();
-    if !notes.is_empty() {
-        eprintln!(
-            "discover: skipped, {} has entries a rewrite would drop: {notes:?}",
-            paths.links
-        );
-        return false;
-    }
-    let run = discover::run(net, &opts, &links, &mut state, epoch());
-    if dry {
-        for (title, pick, score, why) in &run.report.verdicts {
-            println!(
-                "{}\t{score}\t{title}\t{why}",
-                if *pick { "pick" } else { "no" }
-            );
+    match discover::once(net, &options(paths), paths, dry, epoch()) {
+        Ok(run) => {
+            if dry {
+                for (title, pick, score, why) in &run.report.verdicts {
+                    println!(
+                        "{}\t{score}\t{title}\t{why}",
+                        if *pick { "pick" } else { "no" }
+                    );
+                }
+                eprintln!("{} (dry run, nothing written)", run.report);
+            } else {
+                eprintln!("{}", run.report);
+            }
+            run.finished
         }
-        eprintln!("{} (dry run, nothing written)", run.report);
-        return run.finished;
-    }
-    if !run.picks.is_empty() {
-        // Read again: the CLI may have changed the file during the run.
-        let now = std::fs::read_to_string(&paths.links).ok();
-        let written = discover::merge(now.as_deref(), &run.picks)
-            .and_then(|t| write_atomic(&paths.links, &t).map_err(|e| e.to_string()));
-        if let Err(e) = written {
-            eprintln!(
-                "discover: {} not written, state kept as it was: {e}",
-                paths.links
-            );
-            return false;
+        Err(e) => {
+            eprintln!("discover: {e}");
+            false
         }
     }
-    let saved = serde_json::to_string(&state)
-        .map_err(|e| e.to_string())
-        .and_then(|t| write_atomic(&paths.state, &t).map_err(|e| e.to_string()));
-    if let Err(e) = saved {
-        eprintln!("discover: state {} not saved: {e}", paths.state);
-    }
-    eprintln!("{}", run.report);
-    run.finished
 }
 
 /// Check every 30 minutes, the first two minutes after start; run when a day has passed.
@@ -279,7 +217,7 @@ fn discover_loop(paths: &Paths) {
     let net = Http::new();
     std::thread::sleep(Duration::from_secs(120));
     loop {
-        if paths.options().discover && discover::due(&paths.state(), epoch()) {
+        if discover::should_run(&options(paths), &paths.state(), epoch()) {
             discover_once(&net, paths, false);
         }
         std::thread::sleep(Duration::from_secs(1800));
@@ -292,7 +230,7 @@ fn discover_now(args: &[String]) -> i32 {
     if flag(args, "--options").is_none() {
         with_default.extend(["--options".into(), "/data/options.json".into()]);
     }
-    let Some(paths) = Paths::from(&with_default, &links) else {
+    let Some(paths) = paths(&with_default, &links) else {
         return 2;
     };
     let dry = args.iter().any(|a| a == "--dry-run");

@@ -40,7 +40,7 @@ Once a day the add-on searches GitHub and adds up to `per_day` projects a local 
 | Search | One GitHub search per topic, unauthenticated, 7 s apart: created in the last 90 days, pushed in the last 30, at least 5 stars, not archived, not a fork, sorted by stars, 10 results. |
 | Filter | Kept: a licence GitHub recognises and a description. Skipped: anything listed, judged in the last 180 days, or added by discovery before (so a removed pick is not added again). |
 | Judge | Up to 40 candidates a run, each sent to `model` on the router with a brief built from the finds added by hand and the discovered finds that were removed. The model answers pick, score 0 to 10 and why. |
-| Add | Picks scoring 7 or more, best score first, then stars; up to `per_day`. The model's reason is the find's `why`, the first four topics its tags. A pick past the day's quota is judged again the next day. |
+| Add | Picks scoring 7 or more, best score first, then stars; up to `per_day`, one per owner. The model's reason is the find's `why`. Tags are the project's topics that match a search topic or a tag already in the list, up to four, filled to two from its other topics. A pick past the quota or a second from one owner is judged again the next day. |
 
 The first check runs two minutes after start, then every 30 minutes; a run starts when a day has passed since the last finished one. A run that could not reach the router, or whose every search failed, does not count as finished, so the next check tries again. The verdicts already in are kept and not asked again. Each run logs one line: searches, candidates, verdicts, picks, deferred, and the names added.
 
@@ -54,11 +54,11 @@ State lives in `/data/discover.json` inside the add-on.
 | `topics` | `home-assistant`, `hacs`, `unifi`, `proxmox`, `esphome`, `zigbee`, `mcp`, `bitnet` | GitHub topics, one search each. |
 | `router` | Voice Bridge, `http://local-voice-bridge:8789/v1` | Any OpenAI-compatible base URL ending in `/v1`. |
 
-One run now, inside the add-on (`--dry-run` prints each verdict and writes nothing):
+One run now, inside the add-on's container; the paths default to the add-on's. `--dry-run` prints each verdict and writes nothing.
 
 ```
-docker exec addon_local_github_finds github-finds discover --dry-run
-docker exec addon_local_github_finds github-finds discover
+github-finds discover --dry-run
+github-finds discover
 ```
 
 ## Adding finds by hand
