@@ -1,15 +1,16 @@
 [package]
 name = "github-finds"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Links to GitHub projects, served as one page from a Home Assistant add-on"
+description = "GitHub projects found daily and judged by a local model, served as one page from a Home Assistant add-on"
 publish = false
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tiny_http = "0.12.0"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 
 [profile.release]
 opt-level = "z"

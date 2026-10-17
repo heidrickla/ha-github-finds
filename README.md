@@ -1,11 +1,12 @@
 # ha-github-finds
 
-A Home Assistant add-on that serves a page of GitHub projects picked for the owner, and the CLI that keeps its list.
+A Home Assistant add-on that serves a page of GitHub projects picked for the owner, finds new ones daily with a local model as judge, and the CLI that keeps its list.
 
 | Path | What |
 |---|---|
 | `src/lib.rs` | The link model, the rules an entry must pass, and the server's routes. |
-| `src/main.rs` | `serve` for the add-on; `add`, `list`, `remove` over SSH from a workstation. |
+| `src/discover.rs` | Daily discovery: the search query, candidate filter, model brief and request, verdict parsing, selection and merge. |
+| `src/main.rs` | `serve` for the add-on with the daily discovery thread; `discover` for one run now; `add`, `list`, `remove` over SSH from a workstation. |
 | `src/web/` | The page, embedded in the binary. |
 | `github_finds/` | The add-on: config, Dockerfile, run script, docs. |
 | `tools/deploy.sh` | Builds the static binary and copies the add-on to the host's `/local_apps`. |

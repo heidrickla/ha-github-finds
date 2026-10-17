@@ -1,0 +1,16 @@
+configuration:
+  discover:
+    name: Daily discovery
+    description: Search GitHub once a day and add the projects the model picks.
+  per_day:
+    name: Finds per day
+    description: The most projects one day's search adds.
+  model:
+    name: Model
+    description: The router's model name that judges each candidate.
+  topics:
+    name: Topics
+    description: GitHub topics searched, one search each.
+  router:
+    name: Router
+    description: The OpenAI-compatible base URL, ending in /v1. Empty means the Voice Bridge router.

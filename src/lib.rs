@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod discover;
+
 pub const GITHUB: &str = "https://github.com/";
 const INDEX: &str = include_str!("web/index.html");
 const APP: &str = include_str!("web/app.js");
