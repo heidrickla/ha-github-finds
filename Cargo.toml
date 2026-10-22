@@ -1,6 +1,6 @@
 [package]
 name = "github-finds"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "GitHub projects found daily and judged by a local model, served as one page from a Home Assistant add-on"

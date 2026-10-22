@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- rustls-webpki 0.103.16 and webpki-roots 1.0.10.
+
 ## 0.2.1
 
 - A find's tags are its topics that match a search topic or a tag in the list, filled to two from its other topics.
