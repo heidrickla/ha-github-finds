@@ -1,5 +1,5 @@
 name: GitHub Finds
-version: "0.3.0"
+version: "0.3.1"
 slug: github_finds
 description: New GitHub projects for your Home Assistant setup, found daily and shown on one page
 url: https://github.com/heidrickla/ha-github-finds

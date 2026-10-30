@@ -17,6 +17,8 @@ Each card shows why the project was picked, its description, language, stars, la
 1. Select the first button to add this repository, then the second to open the add-on.
 2. Select Install, then Start. Nothing needs to be typed.
 
+The add-on runs on amd64 and aarch64 (Raspberry Pi 4 and 5, Home Assistant Green and Yellow).
+
 ## Setup
 
 1. Open Finds in the sidebar. The first search runs two minutes after the start.

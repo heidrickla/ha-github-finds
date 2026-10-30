@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- The image cross-compiles the binary on the build machine's own platform for the target, so an aarch64 image built on an x86 machine no longer compiles under emulation. On a Raspberry Pi the build is native as before.
+
 ## 0.3.0
 
 Backward-incompatible: `router` and `model` no longer have defaults, and the default `topics` changed. An install that relied on the old defaults sets `router`, `model` and `topics` in the options to keep its behaviour.
