@@ -76,7 +76,8 @@ fetch("links.json", { cache: "no-store" })
   .then((d) => {
     state.links = d.links || [];
     const foot = document.getElementById("foot");
-    foot.textContent = state.links.length + " finds" + (d.left_out && d.left_out.length ? ", " + d.left_out.length + " entries left out of the file" : "");
+    const counts = state.links.length + " finds" + (d.left_out && d.left_out.length ? ", " + d.left_out.length + " entries left out of the file" : "");
+    foot.textContent = counts + (d.discovery ? ". " + d.discovery : "");
     render();
     store.set("finds.seen", JSON.stringify(state.links.map((l) => l.url).slice(0, 2000)));
   })

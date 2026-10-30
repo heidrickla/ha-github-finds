@@ -1,43 +1,36 @@
 name: GitHub Finds
-version: "0.2.2"
+version: "0.3.0"
 slug: github_finds
-description: GitHub projects picked for you, on one page
+description: New GitHub projects for your Home Assistant setup, found daily and shown on one page
+url: https://github.com/heidrickla/ha-github-finds
 arch:
   - amd64
-startup: application
-boot: auto
+  - aarch64
 init: false
-stage: stable
-advanced: false
 ports:
   8091/tcp: 8091
-ports_description:
-  8091/tcp: The page over plain HTTP on the LAN
 ingress: true
 ingress_port: 8091
 panel_icon: mdi:github
 panel_title: Finds
 map:
-  - type: addon_config
+  - type: app_config
     read_only: false
-watchdog: http://[HOST]:[PORT:8091]/healthz
 options:
   discover: true
   per_day: 3
-  model: bonsai
   topics:
     - home-assistant
     - hacs
-    - unifi
-    - proxmox
     - esphome
     - zigbee
-    - mcp
-    - bitnet
+    - matter
+    - home-automation
 schema:
   discover: bool
   per_day: int(1,10)
-  model: match(^[A-Za-z0-9._/-]{1,64}$)
   topics:
     - match(^[a-z0-9][a-z0-9-]{0,49}$)
   router: url?
+  model: match(^[A-Za-z0-9._:/-]{1,64}$)?
+  interests: str?

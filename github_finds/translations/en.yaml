@@ -1,16 +1,25 @@
 configuration:
   discover:
     name: Daily discovery
-    description: Search GitHub once a day and add the projects the model picks.
+    description: Search GitHub once a day and add new projects to the page.
   per_day:
     name: Finds per day
-    description: The most projects one day's search adds.
-  model:
-    name: Model
-    description: The router's model name that judges each candidate.
+    description: The most projects one day's search adds, 1 to 10.
   topics:
     name: Topics
     description: GitHub topics searched, one search each.
   router:
-    name: Router
-    description: The OpenAI-compatible base URL, ending in /v1. Empty means the Voice Bridge router.
+    name: Model router
+    description: >-
+      Optional. The base URL of an OpenAI-compatible server, ending in /v1, such as Ollama's
+      http://<host>:11434/v1. Empty adds the most starred new projects with no model.
+  model:
+    name: Model
+    description: Optional. The model the router runs. Empty means the first model the router lists.
+  interests:
+    name: Your setup
+    description: >-
+      Optional. A few sentences about your setup and what you build, for the model to judge
+      against. Empty means the topics above.
+network:
+  8091/tcp: The page over plain HTTP on the LAN, without a Home Assistant login

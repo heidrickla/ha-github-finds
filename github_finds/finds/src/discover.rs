@@ -1,5 +1,5 @@
-//! Daily discovery: a GitHub search per topic, a Bonsai verdict on each new candidate through the
-//! Voice Bridge router, and the best few appended to the list.
+//! Daily discovery: a GitHub search per topic, then either a verdict on each new candidate from a
+//! model behind an OpenAI-compatible router, or, with no router set, the most starred candidates.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 
 use crate::{Link, date_from_days, from_repo, owner_repo, parse, refuse, upsert};
 
-pub const ROUTER: &str = "http://local-voice-bridge:8789/v1";
 pub const DAY: u64 = 86_400;
 /// Verdicts asked for per run; the rest wait for the next day.
 pub const MAX_JUDGED: usize = 40;
@@ -24,8 +23,9 @@ const MIN_STARS: u32 = 5;
 const PROFILE_LINKS: usize = 30;
 const REMOVED_SHOWN: usize = 10;
 const WHY_MAX: usize = 300;
+const INTERESTS_MAX: usize = 1000;
 
-const BRIEF: &str = "You pick GitHub projects for a home-lab owner's reading list. The lab runs Home Assistant with custom integrations and add-ons, UniFi networking, Proxmox and VMware hosts, ESPHome and Zigbee devices, and local LLM agents with ternary and low-bit model training. The owner's tools are mostly Rust and Python.";
+const BRIEF: &str = "You pick GitHub projects for a Home Assistant user's reading list.";
 const ASK: &str = "You get one candidate as JSON. Pick it only if the owner could use it in that setup or learn a technique from it for their own tools. Refuse toys, tutorials, link lists, dotfiles, themes and copies of what they already have. score is 0 to 10. why is one sentence under 200 characters naming what the owner would use it for, with no praise words.";
 
 /// The add-on's options (`/data/options.json`); a missing field takes its default.
@@ -37,10 +37,15 @@ pub struct Options {
     pub topics: Vec<String>,
     #[serde(default = "three")]
     pub per_day: usize,
-    #[serde(default = "bonsai")]
+    /// The router's model name; empty means the first model the router lists.
+    #[serde(default)]
     pub model: String,
+    /// An OpenAI-compatible base URL ending in `/v1`; unset means no model judges.
     #[serde(default)]
     pub router: Option<String>,
+    /// The owner's setup in their own words, for the model's brief.
+    #[serde(default)]
+    pub interests: String,
 }
 
 fn yes() -> bool {
@@ -49,19 +54,14 @@ fn yes() -> bool {
 fn three() -> usize {
     3
 }
-fn bonsai() -> String {
-    "bonsai".into()
-}
 fn default_topics() -> Vec<String> {
     [
         "home-assistant",
         "hacs",
-        "unifi",
-        "proxmox",
         "esphome",
         "zigbee",
-        "mcp",
-        "bitnet",
+        "matter",
+        "home-automation",
     ]
     .map(String::from)
     .to_vec()
@@ -74,12 +74,24 @@ impl Default for Options {
 }
 
 impl Options {
-    pub fn router(&self) -> &str {
+    /// The router's base URL without a trailing slash, or None when none is set.
+    pub fn router(&self) -> Option<&str> {
         self.router
             .as_deref()
+            .map(|r| r.trim().trim_end_matches('/'))
             .filter(|r| !r.is_empty())
-            .unwrap_or(ROUTER)
-            .trim_end_matches('/')
+    }
+
+    /// One sentence on what discovery does with these options, for the log and the page.
+    pub fn describe(&self) -> String {
+        if !self.discover {
+            return "Daily discovery is off.".into();
+        }
+        match (self.router(), self.model.trim()) {
+            (None, _) => "Daily discovery adds the most starred new projects. Set a router in the add-on's options to have a model judge them instead.".into(),
+            (Some(_), "") => "Daily discovery asks the first model the router lists to judge new projects.".into(),
+            (Some(_), model) => format!("Daily discovery asks {model} to judge new projects."),
+        }
     }
 }
 
@@ -142,6 +154,19 @@ pub trait Net {
     fn search(&self, query: &str) -> Result<Value, Fetch>;
     /// One chat completion from the router at `router` (its `/v1` base).
     fn chat(&self, router: &str, body: &Value) -> Result<Value, Fetch>;
+    /// The router's model list (`GET /models`).
+    fn models(&self, router: &str) -> Result<Value, Fetch>;
+}
+
+/// The first model id in an OpenAI-style model list.
+pub fn first_model(list: &Value) -> Option<String> {
+    list["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .map(str::trim)
+        .find(|id| !id.is_empty())
+        .map(String::from)
 }
 
 /// The search for one topic: created in the last 90 days, pushed in the last 30, starred, live.
@@ -158,6 +183,8 @@ pub fn query(topic: &str, today: i64) -> String {
 pub struct Candidate {
     pub url: String,
     pub meta: Value,
+    /// The search topic that found it.
+    pub topic: String,
 }
 
 impl Candidate {
@@ -192,7 +219,7 @@ impl Candidate {
 }
 
 /// The search response's repositories that are github.com pages, licensed, live and described.
-pub fn candidates(response: &Value) -> Vec<Candidate> {
+pub fn candidates(response: &Value, topic: &str) -> Vec<Candidate> {
     let Some(items) = response["items"].as_array() else {
         return vec![];
     };
@@ -214,14 +241,24 @@ pub fn candidates(response: &Value) -> Vec<Candidate> {
             Some(Candidate {
                 url: url.to_string(),
                 meta: m.clone(),
+                topic: topic.to_string(),
             })
         })
         .collect()
 }
 
 /// The system prompt: the brief, the owner's own picks with their reasons, and what they removed.
-pub fn profile(links: &[Link], state: &State) -> String {
+pub fn profile(opts: &Options, links: &[Link], state: &State) -> String {
     let mut text = String::from(BRIEF);
+    let interests: String = opts.interests.trim().chars().take(INTERESTS_MAX).collect();
+    if interests.is_empty() {
+        text.push_str(" Their interests are these GitHub topics: ");
+        text.push_str(&opts.topics.join(", "));
+        text.push('.');
+    } else {
+        text.push_str(" Their setup, in their words: ");
+        text.push_str(&interests);
+    }
     let own: Vec<&Link> = links
         .iter()
         .filter(|l| !state.picked.contains_key(&l.url.to_lowercase()))
@@ -361,6 +398,8 @@ pub fn tags(meta: &Value, vocab: &BTreeSet<String>) -> Vec<String> {
 /// What one run did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Report {
+    /// Who judged: the model's name, or "stars" with no router.
+    pub by: String,
     pub searches: usize,
     pub search_failed: usize,
     pub candidates: usize,
@@ -378,7 +417,12 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "discover: {} searches ({} failed), {} new candidates, {} judged ({} bad replies), {} picked, {} deferred, {} added",
+            "discover by {}: {} searches ({} failed), {} new candidates, {} judged ({} bad replies), {} picked, {} deferred, {} added",
+            if self.by.is_empty() {
+                "nobody"
+            } else {
+                &self.by
+            },
             self.searches,
             self.search_failed,
             self.candidates,
@@ -395,6 +439,96 @@ impl fmt::Display for Report {
             write!(f, "; {n}")?;
         }
         Ok(())
+    }
+}
+
+/// The model to ask: the option, or the first one the router lists when the option is empty.
+pub fn model_for(net: &dyn Net, opts: &Options, router: &str) -> Result<String, String> {
+    let named = opts.model.trim();
+    if !named.is_empty() {
+        return Ok(named.to_string());
+    }
+    let list = net.models(router).map_err(|e| e.to_string())?;
+    first_model(&list).ok_or_else(|| "lists no model; set model in the add-on's options".into())
+}
+
+/// The verdict with no model: every candidate is a pick, ranked later by its stars.
+pub fn by_stars(c: &Candidate) -> Verdict {
+    let created = c.meta["created_at"]
+        .as_str()
+        .map(|s| s.chars().take(10).collect::<String>());
+    let why = match created {
+        Some(day) => format!(
+            "One of the most starred new {} projects: {} stars since {day}.",
+            c.topic,
+            c.stars()
+        ),
+        None => format!(
+            "One of the most starred new {} projects: {} stars.",
+            c.topic,
+            c.stars()
+        ),
+    };
+    Verdict {
+        pick: true,
+        score: MIN_SCORE,
+        why,
+    }
+}
+
+/// One run's questions to the model.
+struct Judge<'a> {
+    net: &'a dyn Net,
+    router: &'a str,
+    model: &'a str,
+    prompt: &'a str,
+    today: &'a str,
+}
+
+impl Judge<'_> {
+    /// A verdict on up to `MAX_JUDGED` candidates, and whether the router went down part way.
+    fn all(
+        &self,
+        found: Vec<Candidate>,
+        state: &mut State,
+        report: &mut Report,
+    ) -> (Vec<(Candidate, Verdict)>, bool) {
+        let mut judged = Vec::new();
+        let batch: Vec<Candidate> = found.into_iter().take(MAX_JUDGED).collect();
+        for (i, c) in batch.iter().enumerate() {
+            match self
+                .net
+                .chat(self.router, &request(self.model, self.prompt, c))
+            {
+                Ok(reply) => {
+                    report.judged += 1;
+                    state.seen.insert(c.key(), self.today.to_string());
+                    match verdict(&reply) {
+                        Ok(v) => {
+                            report
+                                .verdicts
+                                .push((c.title(), v.pick, v.score, v.why.clone()));
+                            judged.push((c.clone(), v));
+                        }
+                        Err(e) => {
+                            report.bad_replies += 1;
+                            report.notes.push(format!("{}: {e}", c.title()));
+                        }
+                    }
+                }
+                Err(Fetch::Status(s, e)) if s < 500 => {
+                    report.bad_replies += 1;
+                    state.seen.insert(c.key(), self.today.to_string());
+                    report.notes.push(format!("{}: HTTP {s}: {e}", c.title()));
+                }
+                Err(e) => {
+                    report.deferred = batch.len() - i;
+                    report.notes.push(format!("router {e}"));
+                    return (judged, true);
+                }
+            }
+        }
+        (judged, false)
     }
 }
 
@@ -425,7 +559,7 @@ pub fn run(net: &dyn Net, opts: &Options, links: &[Link], state: &mut State, now
         report.searches += 1;
         match net.search(&query(topic, today)) {
             Ok(response) => {
-                for c in candidates(&response) {
+                for c in candidates(&response, topic) {
                     if known.insert(c.key()) {
                         found.push(c);
                     }
@@ -444,41 +578,35 @@ pub fn run(net: &dyn Net, opts: &Options, links: &[Link], state: &mut State, now
     report.candidates = found.len();
     let searched = report.searches > report.search_failed;
 
-    let prompt = profile(links, state);
-    let mut judged: Vec<(Candidate, Verdict)> = Vec::new();
-    let mut router_down = false;
-    let batch: Vec<Candidate> = found.into_iter().take(MAX_JUDGED).collect();
-    for (i, c) in batch.iter().enumerate() {
-        match net.chat(opts.router(), &request(&opts.model, &prompt, c)) {
-            Ok(reply) => {
-                report.judged += 1;
-                state.seen.insert(c.key(), today_date.clone());
-                match verdict(&reply) {
-                    Ok(v) => {
-                        report
-                            .verdicts
-                            .push((c.title(), v.pick, v.score, v.why.clone()));
-                        judged.push((c.clone(), v));
-                    }
-                    Err(e) => {
-                        report.bad_replies += 1;
-                        report.notes.push(format!("{}: {e}", c.title()));
-                    }
-                }
-            }
-            Err(Fetch::Status(s, e)) if s < 500 => {
-                report.bad_replies += 1;
-                state.seen.insert(c.key(), today_date.clone());
-                report.notes.push(format!("{}: HTTP {s}: {e}", c.title()));
+    let (judged, router_down) = match opts.router() {
+        None => {
+            report.by = "stars".into();
+            let ranked = found.into_iter().map(|c| {
+                let v = by_stars(&c);
+                (c, v)
+            });
+            (ranked.collect(), false)
+        }
+        Some(router) => match model_for(net, opts, router) {
+            Ok(model) => {
+                report.by.clone_from(&model);
+                let prompt = profile(opts, links, state);
+                let ask = Judge {
+                    net,
+                    router,
+                    model: &model,
+                    prompt: &prompt,
+                    today: &today_date,
+                };
+                ask.all(found, state, &mut report)
             }
             Err(e) => {
-                router_down = true;
-                report.deferred = batch.len() - i;
+                report.deferred = found.len().min(MAX_JUDGED);
                 report.notes.push(format!("router {e}"));
-                break;
+                (Vec::new(), true)
             }
-        }
-    }
+        },
+    };
 
     let mut picks: Vec<(Candidate, Verdict)> = judged
         .into_iter()
@@ -692,6 +820,9 @@ mod tests {
         asked: RefCell<Vec<String>>,
         queries: RefCell<Vec<String>>,
         routers: RefCell<Vec<String>>,
+        models: Result<Value, Fetch>,
+        listed: RefCell<usize>,
+        named: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -702,7 +833,14 @@ mod tests {
                 asked: RefCell::new(vec![]),
                 queries: RefCell::new(vec![]),
                 routers: RefCell::new(vec![]),
+                models: Ok(json!({"data": []})),
+                listed: RefCell::new(0),
+                named: RefCell::new(vec![]),
             }
+        }
+        fn lists(mut self, models: Result<Value, Fetch>) -> Fake {
+            self.models = models;
+            self
         }
         fn topic(mut self, t: &str, repos: Vec<Value>) -> Fake {
             self.results.insert(t.into(), Ok(json!({ "items": repos })));
@@ -736,10 +874,17 @@ mod tests {
                 serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
             let name = card["name"].as_str().unwrap().to_string();
             self.asked.borrow_mut().push(name.clone());
+            self.named
+                .borrow_mut()
+                .push(body["model"].as_str().unwrap_or_default().into());
             self.verdicts
                 .get(&name)
                 .cloned()
                 .unwrap_or_else(|| Ok(answer(false, 1, "Outside the lab")))
+        }
+        fn models(&self, _router: &str) -> Result<Value, Fetch> {
+            *self.listed.borrow_mut() += 1;
+            self.models.clone()
         }
     }
 
@@ -747,6 +892,8 @@ mod tests {
         Options {
             topics: topics.iter().map(|t| t.to_string()).collect(),
             per_day,
+            router: Some("http://router.test/v1".into()),
+            model: "m".into(),
             ..Options::default()
         }
     }
@@ -756,15 +903,121 @@ mod tests {
         let o = Options::default();
         assert!(o.discover);
         assert_eq!(o.per_day, 3);
-        assert_eq!(o.model, "bonsai");
-        assert_eq!(o.topics.len(), 8);
-        assert_eq!(o.router(), ROUTER);
+        assert_eq!(o.model, "");
+        assert_eq!(o.interests, "");
+        assert_eq!(o.topics.len(), 6);
+        assert!(o.topics.iter().all(|t| valid_topic(t)));
+        assert_eq!(o.router(), None, "no router is set by default");
         let o: Options =
             serde_json::from_str(r#"{"router": "http://x:1/v1/", "per_day": 1}"#).unwrap();
-        assert_eq!(o.router(), "http://x:1/v1");
+        assert_eq!(o.router(), Some("http://x:1/v1"));
         assert_eq!(o.per_day, 1);
-        let o: Options = serde_json::from_str(r#"{"router": ""}"#).unwrap();
-        assert_eq!(o.router(), ROUTER);
+        for blank in [
+            r#"{"router": ""}"#,
+            r#"{"router": "  "}"#,
+            r#"{"router": null}"#,
+        ] {
+            let o: Options = serde_json::from_str(blank).unwrap();
+            assert_eq!(o.router(), None, "{blank}");
+        }
+    }
+
+    #[test]
+    fn the_description_says_what_discovery_does() {
+        let mut o = Options::default();
+        assert!(o.describe().contains("most starred"));
+        assert!(o.describe().contains("Set a router"));
+        o.router = Some("http://x:1/v1".into());
+        assert!(o.describe().contains("first model the router lists"));
+        o.model = "small".into();
+        assert!(o.describe().contains("asks small"));
+        o.discover = false;
+        assert_eq!(o.describe(), "Daily discovery is off.");
+    }
+
+    #[test]
+    fn the_first_listed_model_is_taken() {
+        assert_eq!(
+            first_model(&json!({"data": [{"id": " "}, {"id": "a"}, {"id": "b"}]})).as_deref(),
+            Some("a")
+        );
+        assert_eq!(first_model(&json!({"data": []})), None);
+        assert_eq!(first_model(&json!({"models": [{"id": "a"}]})), None);
+    }
+
+    #[test]
+    fn an_empty_model_is_discovered_from_the_router() {
+        let net = Fake::new()
+            .topic("mcp", vec![repo("a/x", 5), repo("a/y", 5)])
+            .lists(Ok(json!({"data": [{"id": "found-1"}, {"id": "found-2"}]})));
+        let mut o = opts(&["mcp"], 3);
+        o.model = String::new();
+        let r = run(&net, &o, &[], &mut State::default(), NOW);
+        assert!(r.finished);
+        assert_eq!(*net.named.borrow(), ["found-1", "found-1"]);
+        assert_eq!(*net.listed.borrow(), 1, "listed once a run");
+        assert_eq!(r.report.by, "found-1");
+        let named = Fake::new().topic("mcp", vec![repo("a/x", 5)]);
+        run(&named, &opts(&["mcp"], 3), &[], &mut State::default(), NOW);
+        assert_eq!(*named.listed.borrow(), 0, "a named model is not looked up");
+        assert_eq!(*named.named.borrow(), ["m"]);
+    }
+
+    #[test]
+    fn a_router_that_lists_no_model_or_cannot_list_leaves_the_run_unfinished() {
+        for models in [
+            Ok(json!({"data": []})),
+            Err(Fetch::Down("refused".into())),
+            Err(Fetch::Status(404, "no".into())),
+        ] {
+            let net = Fake::new().topic("mcp", vec![repo("a/x", 5)]).lists(models);
+            let mut o = opts(&["mcp"], 3);
+            o.model = String::new();
+            let mut state = State::default();
+            let r = run(&net, &o, &[], &mut state, NOW);
+            assert!(!r.finished);
+            assert_eq!(state.last_run, 0);
+            assert!(net.asked.borrow().is_empty());
+            assert_eq!(r.report.deferred, 1);
+            assert!(
+                r.report.notes[0].starts_with("router "),
+                "{:?}",
+                r.report.notes
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_router_the_most_starred_are_added_and_nothing_is_asked() {
+        let net = Fake::new()
+            .topic("hacs", vec![repo("a/few", 6), repo("b/many", 300)])
+            .topic("matter", vec![repo("c/mid", 40), repo("a/other", 900)]);
+        let o = Options {
+            topics: vec!["hacs".into(), "matter".into()],
+            per_day: 2,
+            ..Options::default()
+        };
+        let mut state = State::default();
+        let r = run(&net, &o, &[], &mut state, NOW);
+        assert!(r.finished);
+        assert!(net.asked.borrow().is_empty());
+        assert_eq!(*net.listed.borrow(), 0);
+        assert_eq!(
+            r.picks.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["a/other", "b/many"],
+            "by stars, one per owner"
+        );
+        assert_eq!(
+            r.picks[0].why,
+            "One of the most starred new matter projects: 900 stars since 2026-09-01."
+        );
+        assert_eq!(r.report.by, "stars");
+        assert!(
+            state.seen.is_empty(),
+            "the rest stay candidates for later days"
+        );
+        assert!(state.picked.contains_key("https://github.com/a/other"));
+        assert_eq!(state.last_run, NOW);
     }
 
     #[test]
@@ -815,19 +1068,22 @@ mod tests {
         elsewhere["html_url"] = json!("https://gitlab.com/a/elsewhere");
         let mut slash = repo("a/slash", 9);
         slash["html_url"] = json!("https://github.com/a/slash/");
-        let got = candidates(&json!({"items": [
-            repo("a/kept", 9), unlicensed, noassert, archived, fork, blank, elsewhere, slash
-        ]}));
+        let got = candidates(
+            &json!({"items": [
+                repo("a/kept", 9), unlicensed, noassert, archived, fork, blank, elsewhere, slash
+            ]}),
+            "t",
+        );
         assert_eq!(
             got.iter().map(|c| c.url.as_str()).collect::<Vec<_>>(),
             ["https://github.com/a/kept", "https://github.com/a/slash"]
         );
-        assert!(candidates(&json!({"message": "rate limited"})).is_empty());
+        assert!(candidates(&json!({"message": "rate limited"}), "t").is_empty());
     }
 
     #[test]
     fn the_card_carries_what_the_model_judges() {
-        let c = &candidates(&json!({"items": [repo("o/r", 12)]}))[0];
+        let c = &candidates(&json!({"items": [repo("o/r", 12)]}), "t")[0];
         let card = c.card();
         assert_eq!(card["name"], "o/r");
         assert_eq!(card["license"], "MIT");
@@ -857,17 +1113,36 @@ mod tests {
             },
         );
         let links = vec![
-            own("https://github.com/Alex/Own"),
+            own("https://github.com/Me/Own"),
             own("https://github.com/d/kept"),
         ];
-        let p = profile(&links, &state);
+        let o = Options::default();
+        let p = profile(&o, &links, &state);
         assert!(p.starts_with(BRIEF));
         assert!(p.ends_with(ASK));
-        assert!(p.contains("- Alex/Own [unifi]: A field-name source"));
+        assert!(p.contains("- Me/Own [unifi]: A field-name source"));
         assert!(!p.contains("d/kept"));
         assert!(p.contains("that they removed:\n- d/gone: A gone thing"));
-        let bare = profile(&[], &State::default());
-        assert_eq!(bare, format!("{BRIEF}\n\n{ASK}"));
+        let bare = profile(&o, &[], &State::default());
+        assert_eq!(
+            bare,
+            format!(
+                "{BRIEF} Their interests are these GitHub topics: home-assistant, hacs, esphome, zigbee, matter, home-automation.\n\n{ASK}"
+            )
+        );
+        let own_words = Options {
+            interests: format!("  A small flat with Zigbee lights. {}", "x".repeat(2000)),
+            ..Options::default()
+        };
+        let p = profile(&own_words, &[], &State::default());
+        assert!(p.starts_with(&format!(
+            "{BRIEF} Their setup, in their words: A small flat with Zigbee lights."
+        )));
+        assert!(!p.contains("GitHub topics"));
+        assert_eq!(
+            p.matches('x').count(),
+            INTERESTS_MAX - "A small flat with Zigbee lights. ".len()
+        );
     }
 
     #[test]
@@ -886,7 +1161,7 @@ mod tests {
                 },
             );
         }
-        let p = profile(&links, &state);
+        let p = profile(&Options::default(), &links, &state);
         assert_eq!(p.matches("\n- o/r").count(), PROFILE_LINKS);
         assert_eq!(p.matches("\n- gone/g").count(), REMOVED_SHOWN);
         assert!(p.contains("gone/g14"), "newest removed first");
@@ -895,9 +1170,9 @@ mod tests {
 
     #[test]
     fn the_request_turns_thinking_off_and_asks_for_the_schema() {
-        let c = &candidates(&json!({"items": [repo("o/r", 1)]}))[0];
-        let r = request("bonsai", "SYS", c);
-        assert_eq!(r["model"], "bonsai");
+        let c = &candidates(&json!({"items": [repo("o/r", 1)]}), "t")[0];
+        let r = request("small", "SYS", c);
+        assert_eq!(r["model"], "small");
         assert_eq!(r["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(r["response_format"]["type"], "json_schema");
         assert_eq!(r["messages"][0]["content"], "SYS");
@@ -1042,7 +1317,7 @@ mod tests {
         let net = Fake::new().topic(
             "mcp",
             vec![
-                repo("Alex/Own", 5),
+                repo("Me/Own", 5),
                 repo("s/seen", 5),
                 repo("p/picked", 5),
                 repo("n/new", 5),
@@ -1063,7 +1338,7 @@ mod tests {
         let r = run(
             &net,
             &opts(&["mcp"], 3),
-            &[own("https://github.com/alex/own")],
+            &[own("https://github.com/me/own")],
             &mut state,
             NOW,
         );
@@ -1423,6 +1698,7 @@ mod tests {
     #[test]
     fn the_report_line_names_counts_additions_and_notes() {
         let r = Report {
+            by: "small".into(),
             searches: 8,
             search_failed: 1,
             candidates: 20,
@@ -1436,7 +1712,7 @@ mod tests {
         };
         assert_eq!(
             r.to_string(),
-            "discover: 8 searches (1 failed), 20 new candidates, 19 judged (1 bad replies), 4 picked, 0 deferred, 2 added: a/b, c/d; search x: HTTP 403: limit"
+            "discover by small: 8 searches (1 failed), 20 new candidates, 19 judged (1 bad replies), 4 picked, 0 deferred, 2 added: a/b, c/d; search x: HTTP 403: limit"
         );
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "github-finds"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "GitHub projects found daily and judged by a local model, served as one page from a Home Assistant add-on"
+description = "New GitHub projects found daily, judged by stars or by a model, served as one page from a Home Assistant add-on"
 publish = false
 
 [dependencies]

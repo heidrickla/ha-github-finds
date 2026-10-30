@@ -1,6 +1,6 @@
 //! `github-finds serve` runs in the add-on and searches for finds once a day; `discover` runs one
-//! search now. `add`, `list` and `remove` edit the links file on the Home Assistant host over SSH,
-//! taking a repository's details from `gh api`.
+//! search now. `add`, `list` and `remove` edit the links file on the Home Assistant host over SSH
+//! from a workstation, taking a repository's details from `gh api`.
 
 use std::cell::Cell;
 use std::io::{Read, Write};
@@ -18,9 +18,12 @@ use tiny_http::{Header, Method, Response, Server};
 const USAGE: &str = "usage:
   github-finds serve [--links /config/links.json] [--port 8091] [--options /data/options.json] [--state /data/discover.json]
   github-finds discover [--links ...] [--options ...] [--state ...] [--dry-run]
-  github-finds add <github url> --why <text> [--tags a,b] [--host root@192.0.2.10] [--ssh-port 22] [--key ~/.ssh/ha_ed25519]
-  github-finds list | remove <github url>   (same --host, --ssh-port, --key)";
-const DIR: &str = "/addon_configs/local_github_finds";
+  github-finds add <github url> --why <text> [--tags a,b] --host <user@host> [--ssh-port 22] [--key <file>] [--dir <folder>]
+  github-finds list | remove <github url>   (same --host, --ssh-port, --key, --dir)
+The SSH settings may instead come from GITHUB_FINDS_HOST, GITHUB_FINDS_SSH_PORT, GITHUB_FINDS_KEY
+and GITHUB_FINDS_DIR; a flag wins over its variable.";
+/// The add-on's config folder on the host when it is installed from the GitHub repository.
+const DIR: &str = "/addon_configs/75df1782_github_finds";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -62,9 +65,15 @@ fn serve(args: &[String]) -> i32 {
     for note in notes {
         eprintln!("left out: {note}");
     }
-    if let Some(paths) = paths(args, &links) {
-        std::thread::spawn(move || discover_loop(&paths));
-    }
+    let discovery = match paths(args, &links) {
+        Some(paths) => {
+            let said = options(&paths).describe();
+            std::thread::spawn(move || discover_loop(&paths));
+            said
+        }
+        None => "Daily discovery is off.".to_string(),
+    };
+    eprintln!("{discovery}");
     let headers = [
         (
             "Content-Security-Policy",
@@ -77,7 +86,7 @@ fn serve(args: &[String]) -> i32 {
     for request in server.incoming_requests() {
         let reply = if matches!(request.method(), Method::Get | Method::Head) {
             let file = std::fs::read_to_string(&links).ok();
-            respond(request.url(), file.as_deref())
+            respond(request.url(), file.as_deref(), &discovery)
         } else {
             github_finds::Reply {
                 status: 405,
@@ -177,6 +186,15 @@ impl Net for Http {
         )
     }
 
+    fn models(&self, router: &str) -> Result<Value, Fetch> {
+        answer(
+            self.agent
+                .get(format!("{router}/models"))
+                .header("User-Agent", AGENT)
+                .call(),
+        )
+    }
+
     fn chat(&self, router: &str, body: &Value) -> Result<Value, Fetch> {
         answer(
             self.agent
@@ -244,33 +262,55 @@ fn discover_now(args: &[String]) -> i32 {
 struct Remote {
     host: String,
     port: String,
-    key: String,
+    key: Option<String>,
+    dir: String,
+}
+
+/// A folder name safe to put in the remote shell command unquoted.
+fn plain_dir(d: &str) -> bool {
+    d.starts_with('/')
+        && d.len() > 1
+        && !d.contains("..")
+        && d.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c))
 }
 
 impl Remote {
-    fn from(args: &[String]) -> Remote {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_default();
-        Remote {
-            host: flag(args, "--host").unwrap_or_else(|| "root@192.0.2.10".into()),
-            port: flag(args, "--ssh-port").unwrap_or_else(|| "22".into()),
-            key: flag(args, "--key").unwrap_or_else(|| format!("{home}/.ssh/ha_ed25519")),
+    /// The SSH target from the flags, else the environment; the host has no default.
+    fn from(args: &[String], env: impl Fn(&str) -> Option<String>) -> Result<Remote, String> {
+        let pick = |name: &str, var: &str| {
+            flag(args, name).or_else(|| env(var).filter(|v| !v.trim().is_empty()))
+        };
+        let host = pick("--host", "GITHUB_FINDS_HOST")
+            .ok_or("no host: pass --host user@host or set GITHUB_FINDS_HOST")?;
+        if host.starts_with('-') {
+            return Err(format!("host {host} would read as an ssh option"));
         }
+        let port = pick("--ssh-port", "GITHUB_FINDS_SSH_PORT").unwrap_or_else(|| "22".into());
+        if port.parse::<u16>().is_err() {
+            return Err(format!("ssh port {port} is not a port number"));
+        }
+        let dir = pick("--dir", "GITHUB_FINDS_DIR").unwrap_or_else(|| DIR.into());
+        if !plain_dir(&dir) {
+            return Err(format!(
+                "folder {dir} must be an absolute path of letters, digits and _ . / -"
+            ));
+        }
+        Ok(Remote {
+            host,
+            port,
+            key: pick("--key", "GITHUB_FINDS_KEY"),
+            dir: dir.trim_end_matches('/').to_string(),
+        })
     }
 
     fn run(&self, command: &str, input: Option<&[u8]>) -> Result<String, String> {
-        let mut child = Command::new("ssh")
-            .args([
-                "-i",
-                &self.key,
-                "-p",
-                &self.port,
-                "-o",
-                "BatchMode=yes",
-                &self.host,
-                command,
-            ])
+        let mut ssh = Command::new("ssh");
+        if let Some(key) = &self.key {
+            ssh.args(["-i", key]);
+        }
+        let mut child = ssh
+            .args(["-p", &self.port, "-o", "BatchMode=yes", &self.host, command])
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -300,7 +340,11 @@ impl Remote {
 
     /// The links on the host; an absent file is an empty list. Markers keep a login banner out.
     fn read(&self) -> Result<Vec<Link>, String> {
-        let out = self.run(&format!("echo __FINDS__; sudo -n cat {DIR}/links.json 2>/dev/null || echo '[]'; echo __END__"), None)?;
+        let dir = &self.dir;
+        let out = self.run(
+            &format!("{AS_ROOT}; echo __FINDS__; $S cat {dir}/links.json 2>/dev/null || echo '[]'; echo __END__"),
+            None,
+        )?;
         let body = out
             .split("__FINDS__")
             .nth(1)
@@ -317,12 +361,20 @@ impl Remote {
 
     fn write(&self, links: &[Link]) -> Result<(), String> {
         let json = serde_json::to_string_pretty(links).map_err(|e| e.to_string())? + "\n";
+        let dir = &self.dir;
         self.run(
-            &format!("sudo -n sh -c 'mkdir -p {DIR} && cat > {DIR}/.links.tmp && chmod 644 {DIR}/.links.tmp && mv {DIR}/.links.tmp {DIR}/links.json'"),
+            &format!("{AS_ROOT}; $S sh -c 'mkdir -p {dir} && cat > {dir}/.links.tmp && chmod 644 {dir}/.links.tmp && mv {dir}/.links.tmp {dir}/links.json'"),
             Some(json.as_bytes()),
         )
         .map(|_| ())
     }
+}
+
+/// Root reads the add-on's folder directly; any other user goes through `sudo -n`.
+const AS_ROOT: &str = r#"S=; [ "$(id -u)" = 0 ] || S="sudo -n""#;
+
+fn remote(args: &[String]) -> Result<Remote, String> {
+    Remote::from(args, |v| std::env::var(v).ok())
 }
 
 /// Today's UTC date as YYYY-MM-DD.
@@ -374,8 +426,8 @@ fn add(args: &[String]) -> i32 {
         eprintln!("refused: {r}");
         return 2;
     }
-    let remote = Remote::from(args);
-    let result = remote.read().and_then(|mut links| {
+    let result = remote(args).and_then(|remote| {
+        let mut links = remote.read()?;
         let replaced = upsert(&mut links, link.clone());
         remote.write(&links).map(|()| (replaced, links.len()))
     });
@@ -396,7 +448,7 @@ fn add(args: &[String]) -> i32 {
 }
 
 fn list(args: &[String]) -> i32 {
-    match Remote::from(args).read() {
+    match remote(args).and_then(|r| r.read()) {
         Ok(links) => {
             for l in &links {
                 println!("{}\t{}\t{}\t{}", l.added, l.title, l.tags.join(","), l.url);
@@ -416,8 +468,8 @@ fn remove(args: &[String]) -> i32 {
         eprintln!("{USAGE}");
         return 2;
     };
-    let remote = Remote::from(args);
-    let result = remote.read().and_then(|mut links| {
+    let result = remote(args).and_then(|remote| {
+        let mut links = remote.read()?;
         if !remove_url(&mut links, &url) {
             return Err(format!("no link {url}"));
         }
@@ -455,5 +507,59 @@ mod tests {
         assert_eq!(flag(&args, "--why").as_deref(), Some("w"));
         assert_eq!(flag(&args, "--tags").as_deref(), Some("a,b"));
         assert_eq!(flag(&args, "--host"), None);
+    }
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_ssh_target_has_no_default_host_and_flags_beat_the_environment() {
+        let none = |_: &str| None;
+        let err = Remote::from(&argv(&["list"]), none).err().unwrap();
+        assert!(err.contains("GITHUB_FINDS_HOST"), "{err}");
+        let env = |v: &str| match v {
+            "GITHUB_FINDS_HOST" => Some("me@ha".to_string()),
+            "GITHUB_FINDS_DIR" => Some("/addon_configs/local_github_finds/".to_string()),
+            "GITHUB_FINDS_KEY" => Some(" ".to_string()),
+            _ => None,
+        };
+        let r = Remote::from(&argv(&["list"]), env).unwrap();
+        assert_eq!(
+            (r.host.as_str(), r.port.as_str(), r.dir.as_str(), r.key),
+            ("me@ha", "22", "/addon_configs/local_github_finds", None)
+        );
+        let r = Remote::from(
+            &argv(&[
+                "list",
+                "--host",
+                "root@h",
+                "--ssh-port",
+                "2200",
+                "--key",
+                "k",
+            ]),
+            env,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.host.as_str(), r.port.as_str(), r.key.as_deref()),
+            ("root@h", "2200", Some("k"))
+        );
+        let r = Remote::from(&argv(&["list", "--host", "h"]), none).unwrap();
+        assert_eq!(r.dir, DIR);
+    }
+
+    #[test]
+    fn a_folder_or_port_that_could_change_the_remote_command_is_refused() {
+        let none = |_: &str| None;
+        for dir in [
+            "relative", "/", "/a b", "/a;rm", "/a/../b", "/a'b", "/$HOME",
+        ] {
+            let args = argv(&["list", "--host", "h", "--dir", dir]);
+            assert!(Remote::from(&args, none).is_err(), "{dir}");
+        }
+        let args = argv(&["list", "--host", "h", "--ssh-port", "22;x"]);
+        assert!(Remote::from(&args, none).is_err());
     }
 }

@@ -1,0 +1,155 @@
+name: Lint, test and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# The forge runs these jobs too; its runner has no ubuntu-26.04 label.
+jobs:
+  lint:
+    name: Lint
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-26.04' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: yamllint
+        timeout-minutes: 10
+        run: |
+          pipx run yamllint -d "{extends: relaxed, rules: {line-length: {max: 120}, comments: {min-spaces-from-content: 1}}}" \
+            repository.yaml \
+            github_finds/config.yaml \
+            github_finds/translations/en.yaml \
+            .github/workflows/ci.yml
+
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: github_finds/Dockerfile
+
+      # Frenck's app linter: config.yaml against the Supervisor's schema, defaults left implicit,
+      # deprecated keys refused.
+      - name: App linter
+        timeout-minutes: 15
+        uses: frenck/action-app-linter@b9cfd1bc62ba60d2c4fc96317b5f7ada5923f4a7 # v2.21.1
+        with:
+          path: ./github_finds
+
+  rust:
+    name: Rust
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-26.04' || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: github_finds/finds
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rustup-init pinned by version and checked against its published digest; the toolchain is
+      # the one the Dockerfile's Rust image carries.
+      - name: toolchain (pinned)
+        timeout-minutes: 10
+        run: |
+          r=1.29.1
+          i="$RUNNER_TEMP/rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSf -o "$i" "https://static.rust-lang.org/rustup/archive/$r/x86_64-unknown-linux-gnu/rustup-init"
+          echo "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71  $i" | sha256sum -c -
+          chmod +x "$i"
+          "$i" -y --profile minimal --default-toolchain 1.98.1 --component clippy,rustfmt
+          "$HOME/.cargo/bin/rustc" --version | grep -F ' 1.98.1 '
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: toolchain matches the Dockerfile
+        run: grep -q '^FROM rust:1\.98\.1-alpine' ../Dockerfile
+
+      - name: cargo-deny (pinned)
+        timeout-minutes: 5
+        run: |
+          v=0.20.2
+          d=cargo-deny-$v-x86_64-unknown-linux-musl
+          curl -sSfL -o "$RUNNER_TEMP/$d.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/$v/$d.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/$d.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$d.tar.gz" --strip-components=1 -C "$HOME/.cargo/bin" "$d/cargo-deny"
+
+      - name: cargo-nextest (pinned)
+        timeout-minutes: 5
+        run: |
+          n=cargo-nextest-0.9.146-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL -o "$RUNNER_TEMP/$n" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/$n"
+          echo "b64617e8640624e8f9ba99819e37d7971154e97836d7ae4774fed4715501a6aa  $RUNNER_TEMP/$n" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nextest" && tar -xzf "$RUNNER_TEMP/$n" -C "$RUNNER_TEMP/nextest"
+          install -m 755 "$(find "$RUNNER_TEMP/nextest" -type f -name cargo-nextest)" "$HOME/.cargo/bin/"
+          cargo nextest --version
+
+      - name: format
+        run: cargo fmt --check
+
+      - name: lint
+        timeout-minutes: 15
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: test
+        timeout-minutes: 15
+        run: cargo nextest run --locked --no-fail-fast
+
+      - name: dependencies
+        timeout-minutes: 10
+        run: cargo deny check
+
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-26.04' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    env:
+      TAG: github-finds-ci:${{ github.run_id }}-${{ matrix.arch }}
+      NAME: github-finds-ci-${{ github.run_id }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The image for one architecture with the arguments the Supervisor passes, the binary
+      # compiled in the image (under emulation for aarch64, hence the long timeout).
+      - name: Build
+        timeout-minutes: 90
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./github_finds
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_VERSION=ci
+          load: true
+          tags: ${{ env.TAG }}
+          push: false
+
+      # The image is the platform asked for, starts with no options, turns healthy by its own
+      # HEALTHCHECK and serves the list with the sentence saying what discovery does.
+      - name: Run the image
+        timeout-minutes: 10
+        run: |
+          docker image inspect --format '{{.Architecture}}' "$TAG" | grep -qxF "$(basename ${{ matrix.platform }})"
+          since=$(date +%s)
+          docker run -d --name "$NAME" --platform ${{ matrix.platform }} --health-interval 5s "$TAG"
+          grep -m1 -q 'health_status: healthy' \
+            < <(timeout 300 docker events --since "$since" --filter "container=$NAME" --format '{{.Status}}')
+          body=$(docker exec "$NAME" curl -fsS http://127.0.0.1:8091/links.json)
+          grep -qF '"discovery":"Daily discovery adds the most starred' <<<"$body"
+
+      - name: Remove the container and image
+        if: always()
+        run: |
+          docker rm -f "$NAME" || true
+          docker image rm "$TAG" || true

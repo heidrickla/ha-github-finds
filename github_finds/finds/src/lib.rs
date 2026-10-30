@@ -210,8 +210,9 @@ fn reply(status: u16, content_type: &'static str, body: impl Into<String>) -> Re
     }
 }
 
-/// Answer a GET for `path`, given the links file's text (None when it does not exist yet).
-pub fn respond(path: &str, file: Option<&str>) -> Reply {
+/// Answer a GET for `path`, given the links file's text (None when it does not exist yet) and the
+/// sentence saying what discovery does.
+pub fn respond(path: &str, file: Option<&str>, discovery: &str) -> Reply {
     let path = path.split('?').next().unwrap_or("");
     match path {
         "/" | "/index.html" => reply(200, "text/html; charset=utf-8", INDEX),
@@ -220,7 +221,8 @@ pub fn respond(path: &str, file: Option<&str>) -> Reply {
         "/healthz" => reply(200, "text/plain; charset=utf-8", "ok"),
         "/links.json" => {
             let (links, notes) = file.map(parse).unwrap_or_default();
-            let body = serde_json::json!({ "links": links, "left_out": notes });
+            let body =
+                serde_json::json!({ "links": links, "left_out": notes, "discovery": discovery });
             reply(200, "application/json", body.to_string())
         }
         _ => reply(404, "text/plain; charset=utf-8", "not found"),
@@ -467,25 +469,29 @@ mod tests {
     #[test]
     fn routes() {
         assert_eq!(
-            respond("/app.js", None).content_type,
+            respond("/app.js", None, "").content_type,
             "text/javascript; charset=utf-8"
         );
-        assert!(respond("/app.js", None).body.contains("links.json"));
+        assert!(respond("/app.js", None, "").body.contains("links.json"));
         assert_eq!(
-            respond("/style.css", None).content_type,
+            respond("/style.css", None, "").content_type,
             "text/css; charset=utf-8"
         );
-        assert!(respond("/style.css", None).body.contains("--bg"));
-        assert_eq!(respond("/", None).status, 200);
-        assert!(respond("/", None).body.contains("<html"));
-        assert_eq!(respond("/healthz", None).body, "ok");
-        assert_eq!(respond("/nope", None).status, 404);
-        assert_eq!(respond("/../etc/passwd", None).status, 404);
-        let empty = respond("/links.json?x=1", None);
-        assert_eq!(empty.body, r#"{"left_out":[],"links":[]}"#);
+        assert!(respond("/style.css", None, "").body.contains("--bg"));
+        assert_eq!(respond("/", None, "").status, 200);
+        assert!(respond("/", None, "").body.contains("<html"));
+        assert_eq!(respond("/healthz", None, "").body, "ok");
+        assert_eq!(respond("/nope", None, "").status, 404);
+        assert_eq!(respond("/../etc/passwd", None, "").status, 404);
+        let empty = respond("/links.json?x=1", None, "Daily discovery is off.");
+        assert_eq!(
+            empty.body,
+            r#"{"discovery":"Daily discovery is off.","left_out":[],"links":[]}"#
+        );
         let text =
             serde_json::to_string(&vec![link("https://github.com/a/b", "2026-10-01")]).unwrap();
-        let body: Value = serde_json::from_str(&respond("/links.json", Some(&text)).body).unwrap();
+        let body: Value =
+            serde_json::from_str(&respond("/links.json", Some(&text), "").body).unwrap();
         assert_eq!(body["links"][0]["url"], "https://github.com/a/b");
     }
 }
