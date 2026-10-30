@@ -4,11 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Link, date_from_days, from_repo, owner_repo, parse, refuse, upsert};
+use crate::{Link, date_from_days, from_repo, owner_repo, parse, refuse, remove, upsert};
 
 pub const DAY: u64 = 86_400;
 /// Verdicts asked for per run; the rest wait for the next day.
@@ -125,6 +126,9 @@ pub struct State {
     /// Lowercased url of each project discovery added.
     #[serde(default)]
     pub picked: BTreeMap<String, Picked>,
+    /// Lowercased url of each find deleted from the page; discovery never suggests one again.
+    #[serde(default)]
+    pub dismissed: BTreeSet<String>,
 }
 
 /// Whether a run is due: a day since the last one that finished.
@@ -553,6 +557,7 @@ pub fn run(net: &dyn Net, opts: &Options, links: &[Link], state: &mut State, now
     let mut known: BTreeSet<String> = links.iter().map(|l| l.url.to_lowercase()).collect();
     known.extend(state.seen.keys().cloned());
     known.extend(state.picked.keys().cloned());
+    known.extend(state.dismissed.iter().cloned());
 
     let mut found: Vec<Candidate> = Vec::new();
     for topic in opts.topics.iter().filter(|t| valid_topic(t)) {
@@ -678,7 +683,12 @@ pub fn merge(text: Option<&str>, picks: &[Link]) -> Result<String, String> {
     for p in picks {
         upsert(&mut links, p.clone());
     }
-    serde_json::to_string_pretty(&links)
+    listing(&links)
+}
+
+/// The links file's text for `links`.
+fn listing(links: &[Link]) -> Result<String, String> {
+    serde_json::to_string_pretty(links)
         .map(|s| s + "\n")
         .map_err(|e| e.to_string())
 }
@@ -722,6 +732,66 @@ impl Paths {
     }
 }
 
+/// Held for every read-modify-write of the links file or the state file, by a run's save and by a
+/// delete from the page.
+static FILES: Mutex<()> = Mutex::new(());
+
+fn files() -> MutexGuard<'static, ()> {
+    FILES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Why a find was not deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dismiss {
+    /// No find in the list has this url.
+    NotListed,
+    /// A file could not be read or written, or the list holds an entry a rewrite would drop.
+    Failed(String),
+}
+
+/// A file's text, None when it does not exist.
+fn read_if_there(path: &str) -> Result<Option<String>, Dismiss> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Dismiss::Failed(format!("{path}: {e}"))),
+    }
+}
+
+/// Delete the find with this url from the list and record it in the state, so discovery never
+/// adds it again; the number of finds left.
+pub fn dismiss(links_path: &str, state_path: &str, url: &str) -> Result<usize, Dismiss> {
+    let _held = files();
+    let text = read_if_there(links_path)?;
+    let (mut links, notes) = text.as_deref().map(parse).unwrap_or_default();
+    if !notes.is_empty() {
+        return Err(Dismiss::Failed(format!(
+            "{links_path} has entries a rewrite would drop: {notes:?}"
+        )));
+    }
+    if !remove(&mut links, url) {
+        return Err(Dismiss::NotListed);
+    }
+    // A state file that does not parse is refused rather than replaced, so its history stays.
+    let mut state: State = match read_if_there(state_path)? {
+        Some(t) => {
+            serde_json::from_str(&t).map_err(|e| Dismiss::Failed(format!("{state_path}: {e}")))?
+        }
+        None => State::default(),
+    };
+    state.dismissed.insert(url.to_lowercase());
+    // The dismissal is saved first: a failed list write leaves the find shown, still kept out.
+    let failed = |path: &str, e: String| Dismiss::Failed(format!("{path} not written: {e}"));
+    serde_json::to_string(&state)
+        .map_err(|e| e.to_string())
+        .and_then(|t| write_atomic(state_path, &t).map_err(|e| e.to_string()))
+        .map_err(|e| failed(state_path, e))?;
+    listing(&links)
+        .and_then(|t| write_atomic(links_path, &t).map_err(|e| e.to_string()))
+        .map_err(|e| failed(links_path, e))?;
+    Ok(links.len())
+}
+
 /// Write `text` to `path` through a temporary file beside it.
 pub fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.tmp");
@@ -747,10 +817,22 @@ pub fn once(
             paths.links
         ));
     }
-    let outcome = run(net, opts, &links, &mut state, now);
+    let mut outcome = run(net, opts, &links, &mut state, now);
     if dry {
         return Ok(outcome);
     }
+    let _held = files();
+    // A find deleted from the page while the run searched stays deleted and dismissed.
+    let dismissed = paths.state().dismissed;
+    outcome
+        .picks
+        .retain(|l| !dismissed.contains(&l.url.to_lowercase()));
+    let kept = &outcome.picks;
+    outcome
+        .report
+        .added
+        .retain(|t| kept.iter().any(|l| &l.title == t));
+    state.dismissed.extend(dismissed);
     if !outcome.picks.is_empty() {
         // Read again: the CLI may have changed the file during the run.
         let current = std::fs::read_to_string(&paths.links).ok();
@@ -823,6 +905,8 @@ mod tests {
         models: Result<Value, Fetch>,
         listed: RefCell<usize>,
         named: RefCell<Vec<String>>,
+        /// Run at each search, as something else changing the files while a run is out.
+        during: Option<Box<dyn Fn()>>,
     }
 
     impl Fake {
@@ -836,6 +920,7 @@ mod tests {
                 models: Ok(json!({"data": []})),
                 listed: RefCell::new(0),
                 named: RefCell::new(vec![]),
+                during: None,
             }
         }
         fn lists(mut self, models: Result<Value, Fetch>) -> Fake {
@@ -858,6 +943,9 @@ mod tests {
 
     impl Net for Fake {
         fn search(&self, query: &str) -> Result<Value, Fetch> {
+            if let Some(f) = &self.during {
+                f();
+            }
             self.queries.borrow_mut().push(query.into());
             let topic = query
                 .strip_prefix("topic:")
@@ -1493,6 +1581,77 @@ mod tests {
             parse(&std::fs::read_to_string(&p.links).unwrap()).0.len(),
             2
         );
+    }
+
+    #[test]
+    fn a_dismissed_url_is_never_judged_or_picked() {
+        let net = Fake::new()
+            .topic("mcp", vec![repo("N/New", 50), repo("o/other", 5)])
+            .says("N/New", Ok(answer(true, 9, "Useful")))
+            .says("o/other", Ok(answer(true, 9, "Useful")));
+        let mut state = State::default();
+        state.dismissed.insert("https://github.com/n/new".into());
+        let r = run(&net, &opts(&["mcp"], 3), &[], &mut state, NOW);
+        assert_eq!(*net.asked.borrow(), ["o/other"]);
+        assert_eq!(
+            r.picks.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["o/other"]
+        );
+    }
+
+    #[test]
+    fn a_delete_made_while_a_run_searches_survives_its_save() {
+        let p = scratch("during");
+        let old = own("https://github.com/o/old");
+        std::fs::write(&p.links, serde_json::to_string(&vec![old.clone()]).unwrap()).unwrap();
+        let mut net = Fake::new()
+            .topic("mcp", vec![repo("n/new", 50), repo("t/two", 5)])
+            .says("n/new", Ok(answer(true, 9, "Useful")))
+            .says("t/two", Ok(answer(true, 9, "Useful")));
+        // Mid-run, n/new is added by hand and both it and o/old are deleted from the page.
+        let (links, state) = (p.links.clone(), p.state.clone());
+        net.during = Some(Box::new(move || {
+            let both = vec![old.clone(), own("https://github.com/n/new")];
+            std::fs::write(&links, serde_json::to_string(&both).unwrap()).unwrap();
+            dismiss(&links, &state, "https://github.com/n/new").unwrap();
+            dismiss(&links, &state, "https://github.com/o/old").unwrap();
+        }));
+        let r = once(&net, &opts(&["mcp"], 3), &p, false, NOW).unwrap();
+        assert_eq!(r.report.added, ["t/two"]);
+        let (listed, _) = parse(&std::fs::read_to_string(&p.links).unwrap());
+        assert_eq!(
+            listed.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
+            ["t/two"]
+        );
+        let saved = p.state();
+        assert!(saved.dismissed.contains("https://github.com/n/new"));
+        assert!(saved.dismissed.contains("https://github.com/o/old"));
+        assert_eq!(saved.last_run, NOW);
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&p.links).parent().unwrap());
+    }
+
+    #[test]
+    fn a_delete_keeps_a_damaged_list_and_an_unreadable_state() {
+        let p = scratch("dismiss-refused");
+        let bad = r#"[{"url": "https://example.com/x", "title": "t", "why": "w", "added": "2026-10-01"}]"#;
+        std::fs::write(&p.links, bad).unwrap();
+        let url = "https://example.com/x";
+        assert!(matches!(
+            dismiss(&p.links, &p.state, url),
+            Err(Dismiss::Failed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&p.links).unwrap(), bad);
+        let good = serde_json::to_string(&vec![own("https://github.com/o/old")]).unwrap();
+        std::fs::write(&p.links, &good).unwrap();
+        std::fs::write(&p.state, "not json").unwrap();
+        let old = "https://github.com/o/old";
+        assert!(matches!(
+            dismiss(&p.links, &p.state, old),
+            Err(Dismiss::Failed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&p.links).unwrap(), good);
+        assert_eq!(std::fs::read_to_string(&p.state).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&p.links).parent().unwrap());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 :root, [data-theme="dark"] {
   --bg: #0f1115; --card: #171a21; --line: #262b36; --text: #e6e8ec; --muted: #9aa3b2;
-  --accent: #6ea8fe; --chip: #222733; --new: #3fb950;
+  --accent: #6ea8fe; --chip: #222733; --new: #3fb950; --danger: #f85149;
 }
 [data-theme="light"] {
   --bg: #f6f7f9; --card: #ffffff; --line: #e1e4e8; --text: #1f2328; --muted: #59636e;
-  --accent: #0969da; --chip: #eef1f4; --new: #1a7f37;
+  --accent: #0969da; --chip: #eef1f4; --new: #1a7f37; --danger: #cf222e;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -27,6 +27,13 @@ article a.title:hover { text-decoration: underline; }
 .new { color: var(--new); font-weight: 600; }
 .tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .tags span { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+/* The bottom padding keeps the trashcan clear of the meta and tags lines. */
+article.removable { position: relative; padding-bottom: 44px; }
+.trash { position: absolute; right: 8px; bottom: 8px; min-width: 28px; height: 28px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: 13px; }
+.trash:hover, .trash:focus-visible { color: var(--text); }
+.trash.armed, .trash.armed:hover, .trash.armed:focus-visible { color: var(--danger); border-color: var(--danger); }
+.trash:disabled { cursor: wait; }
 footer { padding: 0 16px 24px; color: var(--muted); font-size: 13px; }
+footer .error { margin: 6px 0 0; color: var(--danger); }
 .empty { color: var(--muted); padding: 24px 0; }
 @media (max-width: 480px) { main { grid-template-columns: 1fr; padding: 12px; } header { padding: 12px; } }

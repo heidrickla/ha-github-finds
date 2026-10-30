@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0
+
+- Each card in the sidebar panel has a trashcan in its bottom-right corner: the first press arms it, a second within 4 s deletes the find from the list and keeps discovery from suggesting it again. The LAN port stays read-only and shows no trashcan.
+
 ## 0.3.1
 
 - The image cross-compiles the binary on the build machine's own platform for the target, so an aarch64 image built on an x86 machine no longer compiles under emulation. On a Raspberry Pi the build is native as before.

@@ -6,7 +6,7 @@ A Home Assistant add-on that finds new GitHub projects for your setup once a day
 
 ![The Finds page with four project cards, tag buttons and a filter box](docs/images/finds.png)
 
-Each card shows why the project was picked, its description, language, stars, last push and tags.
+Each card shows why the project was picked, its description, language, stars, last push and tags. In the sidebar a trashcan in each card's corner deletes a find you no longer want, and discovery does not suggest it again.
 
 ## Install
 

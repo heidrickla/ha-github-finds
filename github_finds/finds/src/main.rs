@@ -4,26 +4,30 @@
 
 use std::cell::Cell;
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use github_finds::discover::{self, Fetch, Net, Options, Paths};
 use github_finds::{
-    GITHUB, Link, date_from_days, from_repo, owner_repo, parse, refuse, remove as remove_url,
-    respond, upsert,
+    GITHUB, INGRESS, Link, MAX_BODY, Reply, date_from_days, from_repo, from_trusted, owner_repo,
+    parse, refuse, remove as remove_url, respond, respond_remove, upsert,
 };
 use serde_json::Value;
 use tiny_http::{Header, Method, Response, Server};
 
 const USAGE: &str = "usage:
-  github-finds serve [--links /config/links.json] [--port 8091] [--options /data/options.json] [--state /data/discover.json]
+  github-finds serve [--links /config/links.json] [--port 8091] [--options /data/options.json] [--state /data/discover.json] [--trusted 172.30.32.2]
   github-finds discover [--links ...] [--options ...] [--state ...] [--dry-run]
   github-finds add <github url> --why <text> [--tags a,b] --host <user@host> [--ssh-port 22] [--key <file>] [--dir <folder>]
   github-finds list | remove <github url>   (same --host, --ssh-port, --key, --dir)
 The SSH settings may instead come from GITHUB_FINDS_HOST, GITHUB_FINDS_SSH_PORT, GITHUB_FINDS_KEY
-and GITHUB_FINDS_DIR; a flag wins over its variable.";
+and GITHUB_FINDS_DIR; a flag wins over its variable. --trusted, the one address allowed to delete
+finds, defaults to Home Assistant's ingress proxy and is changed only for tests.";
 /// The add-on's config folder on the host when it is installed from the GitHub repository.
 const DIR: &str = "/addon_configs/75df1782_github_finds";
+/// Discovery's state, and the dismissed finds, inside the add-on.
+const STATE: &str = "/data/discover.json";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -50,6 +54,15 @@ fn main() {
 fn serve(args: &[String]) -> i32 {
     let links = flag(args, "--links").unwrap_or_else(|| "/config/links.json".into());
     let port = flag(args, "--port").unwrap_or_else(|| "8091".into());
+    let state = flag(args, "--state").unwrap_or_else(|| STATE.into());
+    let trusted = match flag(args, "--trusted").map(|t| t.parse::<IpAddr>()) {
+        None => INGRESS,
+        Some(Ok(ip)) => ip,
+        Some(Err(e)) => {
+            eprintln!("--trusted is not an address: {e}");
+            return 2;
+        }
+    };
     let server = match Server::http(format!("0.0.0.0:{port}")) {
         Ok(s) => s,
         Err(e) => {
@@ -83,16 +96,32 @@ fn serve(args: &[String]) -> i32 {
         ("Referrer-Policy", "no-referrer"),
         ("Cache-Control", "no-store"),
     ];
-    for request in server.incoming_requests() {
-        let reply = if matches!(request.method(), Method::Get | Method::Head) {
-            let file = std::fs::read_to_string(&links).ok();
-            respond(request.url(), file.as_deref(), &discovery)
-        } else {
-            github_finds::Reply {
-                status: 405,
-                content_type: "text/plain; charset=utf-8",
-                body: "GET only".into(),
+    for mut request in server.incoming_requests() {
+        let from = from_trusted(request.remote_addr().map(|a| a.ip()), trusted);
+        let path = request.url().split('?').next().unwrap_or("").to_string();
+        let reply = match request.method() {
+            Method::Get | Method::Head => {
+                let file = std::fs::read_to_string(&links).ok();
+                respond(request.url(), file.as_deref(), &discovery, from)
             }
+            Method::Post if path == "/remove" => {
+                let content_type = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Content-Type"))
+                    .map(|h| h.value.as_str().to_string());
+                // One byte past the limit is enough to know a body is too large.
+                let mut body = Vec::new();
+                let read = request
+                    .as_reader()
+                    .take(MAX_BODY as u64 + 1)
+                    .read_to_end(&mut body);
+                match read {
+                    Ok(_) => respond_remove(from, content_type.as_deref(), &body, &links, &state),
+                    Err(e) => plain(400, format!("body not read: {e}")),
+                }
+            }
+            _ => plain(405, "GET, or POST /remove".into()),
         };
         let mut response = Response::from_string(reply.body).with_status_code(reply.status);
         for (k, v) in headers
@@ -108,12 +137,20 @@ fn serve(args: &[String]) -> i32 {
     0
 }
 
+fn plain(status: u16, body: String) -> Reply {
+    Reply {
+        status,
+        content_type: "text/plain; charset=utf-8",
+        body,
+    }
+}
+
 /// Discovery's files; None without `--options`.
 fn paths(args: &[String], links: &str) -> Option<Paths> {
     Some(Paths {
         links: links.to_string(),
         options: flag(args, "--options")?,
-        state: flag(args, "--state").unwrap_or_else(|| "/data/discover.json".into()),
+        state: flag(args, "--state").unwrap_or_else(|| STATE.into()),
     })
 }
 

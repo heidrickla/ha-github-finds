@@ -14,14 +14,19 @@ The page's footer and the add-on's log say what discovery does with the current 
 
 | Path | Content |
 |---|---|
-| `/` | The page: a filter box, tag buttons, a theme toggle (dark by default, the choice kept in the browser). A find this browser has not shown before is marked new. |
-| `/links.json` | `{"links": [...], "left_out": [...], "discovery": "..."}`: the valid finds, a note for each entry of the file that was left out, and the sentence saying what discovery does. |
+| `/` | The page: a filter box, tag buttons, a theme toggle (dark by default, the choice kept in the browser). A find this browser has not shown before is marked new. In the sidebar each card has a trashcan that deletes the find. |
+| `/links.json` | `{"links": [...], "left_out": [...], "discovery": "...", "can_remove": true}`: the valid finds, a note for each entry of the file that was left out, the sentence saying what discovery does, and whether this page may delete finds (true only through the sidebar). |
+| `POST /remove` | `{"url": "..."}`, the url as in the list: deletes that find. Accepted only from Home Assistant's ingress proxy; 200 with the count left, 404 for a url not in the list, 400 for a body that is not that JSON, 403 from anywhere else. |
 | `/healthz` | `ok`, for Docker's health check. |
 
 | Way in | Where |
 |---|---|
-| Sidebar | Finds, through ingress. Links open in a new tab. |
-| Port 8091 | `http://<home assistant>:8091/` on the LAN: the same read-only page without a Home Assistant login. Clear the port in the Network section to keep the page to the sidebar. |
+| Sidebar | Finds, through ingress. Links open in a new tab. Finds can be deleted. |
+| Port 8091 | `http://<home assistant>:8091/` on the LAN: the same page, read-only, without a Home Assistant login. Clear the port in the Network section to keep the page to the sidebar. |
+
+### Deleting a find
+
+The trashcan in a card's bottom-right corner shows in the sidebar only. The first press turns it red and reads Delete?; a second press within 4 seconds deletes the find, otherwise it goes back. The find leaves `links.json`, and its url is kept in `/data/discover.json` so discovery never suggests it again; that list does not expire.
 
 ## Discovery
 
@@ -30,7 +35,7 @@ Once a day the add-on searches GitHub, one search per topic, and adds up to `per
 | Step | What happens |
 |---|---|
 | Search | One GitHub search per topic, unauthenticated, 7 s apart: created in the last 90 days, pushed in the last 30, at least 5 stars, archived repositories and forks left out, sorted by stars, 10 results. |
-| Filter | Kept: a licence GitHub recognises and a description. Skipped: anything listed, judged in the last 180 days, or added by discovery before, so a removed pick is not added again. |
+| Filter | Kept: a licence GitHub recognises and a description. Skipped: anything listed, judged in the last 180 days, added by discovery before, so a removed pick is not added again, or deleted with the trashcan. |
 | Pick, no router | The most starred candidates across the topics. The reason shown is the topic, the stars and the creation date. |
 | Pick, with a router | Up to 40 candidates a run, each sent to the model with a brief built from `interests` (or the topics), the finds you added yourself with their reasons, and the discovered finds you removed. The model answers pick, score 0 to 10 and why; picks scoring 7 or more are kept, best score first, then stars, and the model's reason is shown. |
 | Add | Up to `per_day`, one per owner. Tags are the project's topics that match a search topic or a tag already in the list, up to four, filled to two from its other topics. A pick past the quota or a second from one owner waits for the next day. |
@@ -107,6 +112,8 @@ github-finds remove https://github.com/owner/repo --host root@homeassistant.loca
 | `--dir` | `GITHUB_FINDS_DIR` | `/addon_configs/75df1782_github_finds`, the folder of this add-on installed from this repository |
 
 The host is one of the SSH add-ons; a user other than root needs passwordless `sudo`. Without `--tags` the first four GitHub topics are used.
+
+`remove` edits only `links.json`: it cannot reach the add-on's `/data`, so a project that discovery has not picked before may be suggested again. The panel's trashcan also keeps discovery from suggesting it.
 
 ## Support
 

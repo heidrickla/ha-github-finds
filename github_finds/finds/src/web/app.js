@@ -5,7 +5,7 @@ const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* private window */ } },
 };
-const state = { links: [], tag: null, text: "" };
+const state = { links: [], tag: null, text: "", leftOut: 0, discovery: "", canRemove: false };
 // Links this browser has already shown; the first visit marks nothing new.
 let seen = null;
 try { seen = new Set(JSON.parse(store.get("finds.seen") || "null")); } catch { seen = null; }
@@ -28,8 +28,71 @@ function el(tag, cls, text) {
   return n;
 }
 
+const SVG = "http://www.w3.org/2000/svg";
+function trashIcon() {
+  const s = document.createElementNS(SVG, "svg");
+  const attrs = { viewBox: "0 0 24 24", width: "16", height: "16", fill: "none", stroke: "currentColor",
+    "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" };
+  Object.entries(attrs).forEach(([k, v]) => s.setAttribute(k, v));
+  ["M4 7h16", "M9 7V4h6v3", "M6 7l1 13h10l1-13", "M10 11v6", "M14 11v6"].forEach((d) => {
+    const p = document.createElementNS(SVG, "path");
+    p.setAttribute("d", d);
+    s.append(p);
+  });
+  return s;
+}
+
+function foot(error) {
+  const f = document.getElementById("foot");
+  const counts = state.links.length + " finds" + (state.leftOut ? ", " + state.leftOut + " entries left out of the file" : "");
+  f.replaceChildren(counts + (state.discovery ? ". " + state.discovery : ""));
+  if (error) f.append(el("p", "error", error));
+}
+
+// The first click arms the button for 4 s; a second click within that deletes the find.
+function trash(l) {
+  const b = el("button", "trash");
+  b.type = "button";
+  let timer = null;
+  const disarm = () => {
+    clearTimeout(timer);
+    timer = null;
+    b.classList.remove("armed");
+    b.replaceChildren(trashIcon());
+    b.setAttribute("aria-label", "Delete " + l.title);
+    b.title = "Delete";
+    b.disabled = false;
+  };
+  disarm();
+  b.addEventListener("click", () => {
+    if (!timer) {
+      b.classList.add("armed");
+      b.replaceChildren(trashIcon(), el("span", "", "Delete?"));
+      b.setAttribute("aria-label", "Delete " + l.title + "? Press again to confirm");
+      b.title = "Delete?";
+      timer = setTimeout(disarm, 4000);
+      return;
+    }
+    clearTimeout(timer);
+    b.disabled = true;
+    fetch("remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: l.url }) })
+      .then((r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        state.links = state.links.filter((x) => x.url !== l.url);
+        if (state.tag && !state.links.some((x) => (x.tags || []).includes(state.tag))) state.tag = null;
+        foot();
+        render();
+      })
+      .catch((e) => {
+        disarm();
+        foot("Could not delete: " + (/^\d+$/.test(e.message) ? e.message : "no answer"));
+      });
+  });
+  return b;
+}
+
 function card(l) {
-  const a = el("article");
+  const a = el("article", state.canRemove ? "removable" : "");
   const title = el("a", "title", l.title);
   title.href = l.url;
   title.rel = "noopener noreferrer";
@@ -49,6 +112,7 @@ function card(l) {
     l.tags.forEach((x) => t.append(el("span", "", x)));
     a.append(t);
   }
+  if (state.canRemove) a.append(trash(l));
   return a;
 }
 
@@ -75,9 +139,10 @@ fetch("links.json", { cache: "no-store" })
   .then((r) => r.json())
   .then((d) => {
     state.links = d.links || [];
-    const foot = document.getElementById("foot");
-    const counts = state.links.length + " finds" + (d.left_out && d.left_out.length ? ", " + d.left_out.length + " entries left out of the file" : "");
-    foot.textContent = counts + (d.discovery ? ". " + d.discovery : "");
+    state.leftOut = (d.left_out || []).length;
+    state.discovery = d.discovery || "";
+    state.canRemove = d.can_remove === true;
+    foot();
     render();
     store.set("finds.seen", JSON.stringify(state.links.map((l) => l.url).slice(0, 2000)));
   })
