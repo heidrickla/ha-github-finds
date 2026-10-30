@@ -6,6 +6,12 @@ A Home Assistant add-on that finds new GitHub projects for your setup once a day
 
 [![Open the GitHub Finds add-on in your Home Assistant](https://my.home-assistant.io/badges/supervisor_addon.svg)](https://my.home-assistant.io/redirect/supervisor_addon/?addon=75df1782_github_finds&repository_url=https%3A%2F%2Fgithub.com%2Fheidrickla%2Fha-github-finds)
 
+## Screenshots
+
+![The Finds page with four project cards, tag buttons and a filter box](docs/images/finds.png)
+
+Each card shows why the project was picked, its description, language, stars, last push and tags.
+
 ## Setup
 
 1. Press the first button to add this repository, then the second to open the add-on.
