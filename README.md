@@ -2,24 +2,29 @@
 
 A Home Assistant add-on that finds new GitHub projects for your setup once a day and shows them on one page in the sidebar: name, why it was picked, description, language, stars, last push and tags. With no options it adds the most starred new projects for a set of Home Assistant topics; point it at a local model (Ollama or any OpenAI-compatible server) and the model judges each project against your setup instead.
 
-[![Add the repository to your Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fheidrickla%2Fha-github-finds)
-
-[![Open the GitHub Finds add-on in your Home Assistant](https://my.home-assistant.io/badges/supervisor_addon.svg)](https://my.home-assistant.io/redirect/supervisor_addon/?addon=75df1782_github_finds&repository_url=https%3A%2F%2Fgithub.com%2Fheidrickla%2Fha-github-finds)
-
 ## Screenshots
 
 ![The Finds page with four project cards, tag buttons and a filter box](docs/images/finds.png)
 
 Each card shows why the project was picked, its description, language, stars, last push and tags.
 
+## Install
+
+[![Add the repository to your Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fheidrickla%2Fha-github-finds)
+
+[![Open the GitHub Finds add-on in your Home Assistant](https://my.home-assistant.io/badges/supervisor_addon.svg)](https://my.home-assistant.io/redirect/supervisor_addon/?addon=75df1782_github_finds&repository_url=https%3A%2F%2Fgithub.com%2Fheidrickla%2Fha-github-finds)
+
+1. Select the first button to add this repository, then the second to open the add-on.
+2. Select Install, then Start. Nothing needs to be typed.
+
 ## Setup
 
-1. Press the first button to add this repository, then the second to open the add-on.
-2. Install and start it. Nothing needs to be typed.
-3. Open Finds in the sidebar. The first search runs two minutes after the start.
-4. Optional: set `router` to a local model's OpenAI-compatible URL to have it judge each project, and `interests` to describe your setup.
+1. Open Finds in the sidebar. The first search runs two minutes after the start.
+2. Optional: set `router` to a local model's OpenAI-compatible URL to have it judge each project, and `interests` to describe your setup.
 
 The page's footer and the add-on's log say what discovery does with the current options.
+
+The finds list is `links.json` in the add-on's config folder, which the add-on maps as `app_config`, so the File editor, Samba and SSH add-ons can reach it. The image has a Docker health check on `/healthz`.
 
 ## Options
 
@@ -44,6 +49,8 @@ Discovery, the list file and the optional command-line tool are described in [DO
 | `github_finds/finds/src/main.rs` | `serve` with the daily discovery thread; `discover` for one run now; `add`, `list`, `remove` over SSH. |
 | `github_finds/finds/src/web/` | The page, embedded in the binary. |
 | `tools/deploy.sh` | Copies the add-on to a host's `/local_apps` as a local add-on (`HA_SSH=user@host`). |
+
+`add`, `list` and `remove` take the SSH host from `--host` or `GITHUB_FINDS_HOST`, with `--key`, `--ssh-port` and `--dir` or their variables; root on the host needs no sudo. The flags and variables are in the table under [Adding finds from a workstation](github_finds/DOCS.md#adding-finds-from-a-workstation).
 
 Gates, from `github_finds/finds`:
 

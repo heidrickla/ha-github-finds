@@ -94,9 +94,9 @@ github-finds discover
 The same binary, built on a workstation with Rust (`cargo install --git https://github.com/heidrickla/ha-github-finds github-finds`), edits the file over SSH with `gh` logged in for the GitHub API. It reads the repository's description, stars, language, last push and topics.
 
 ```
-github-finds add https://github.com/owner/repo --why "Why it was picked" --tags esphome,rust --host root@homeassistant.lan
-github-finds list --host root@homeassistant.lan
-github-finds remove https://github.com/owner/repo --host root@homeassistant.lan
+github-finds add https://github.com/owner/repo --why "Why it was picked" --tags esphome,rust --host root@homeassistant.local
+github-finds list --host root@homeassistant.local
+github-finds remove https://github.com/owner/repo --host root@homeassistant.local
 ```
 
 | Flag | Variable | Default |
