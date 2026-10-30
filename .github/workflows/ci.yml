@@ -144,7 +144,7 @@ jobs:
           since=$(date +%s)
           docker run -d --name "$NAME" --platform ${{ matrix.platform }} --health-interval 5s "$TAG"
           grep -m1 -q 'health_status: healthy' \
-            < <(timeout 300 docker events --since "$since" --filter "container=$NAME" --format '{{.Status}}')
+            < <(timeout 300 docker events --since "$since" --filter "container=$NAME" --format '{{.Action}}')
           body=$(docker exec "$NAME" curl -fsS http://127.0.0.1:8091/links.json)
           grep -qF '"discovery":"Daily discovery adds the most starred' <<<"$body"
 
