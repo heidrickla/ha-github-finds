@@ -3,9 +3,10 @@
 //! from a workstation, taking a repository's details from `gh api`.
 
 use std::cell::Cell;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use github_finds::discover::{self, Fetch, Net, Options, Paths};
@@ -28,6 +29,16 @@ finds, defaults to Home Assistant's ingress proxy and is changed only for tests.
 const DIR: &str = "/addon_configs/75df1782_github_finds";
 /// Discovery's state, and the dismissed finds, inside the add-on.
 const STATE: &str = "/data/discover.json";
+const MAX_IN_FLIGHT: usize = 16;
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct WorkerSlot;
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -87,22 +98,13 @@ fn serve(args: &[String]) -> i32 {
         None => "Daily discovery is off.".to_string(),
     };
     eprintln!("{discovery}");
-    let headers = [
-        (
-            "Content-Security-Policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
-        ),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Referrer-Policy", "no-referrer"),
-        ("Cache-Control", "no-store"),
-    ];
     for mut request in server.incoming_requests() {
         let from = from_trusted(request.remote_addr().map(|a| a.ip()), trusted);
-        let path = request.url().split('?').next().unwrap_or("").to_string();
+        let path = request.url().split('?').next().unwrap_or("");
         let reply = match request.method() {
             Method::Get | Method::Head => {
                 let file = std::fs::read_to_string(&links).ok();
-                respond(request.url(), file.as_deref(), &discovery, from)
+                Some(respond(request.url(), file.as_deref(), &discovery, from))
             }
             Method::Post if path == "/remove" => {
                 let content_type = request
@@ -110,31 +112,74 @@ fn serve(args: &[String]) -> i32 {
                     .iter()
                     .find(|h| h.field.equiv("Content-Type"))
                     .map(|h| h.value.as_str().to_string());
-                // One byte past the limit is enough to know a body is too large.
-                let mut body = Vec::new();
-                let read = request
-                    .as_reader()
-                    .take(MAX_BODY as u64 + 1)
-                    .read_to_end(&mut body);
-                match read {
-                    Ok(_) => respond_remove(from, content_type.as_deref(), &body, &links, &state),
-                    Err(e) => plain(400, format!("body not read: {e}")),
+                if !from {
+                    Some(plain(
+                        403,
+                        "finds are deleted only through Home Assistant".into(),
+                    ))
+                } else if !is_json(content_type.as_deref()) {
+                    Some(plain(415, "Content-Type must be application/json".into()))
+                } else if IN_FLIGHT
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        (n < MAX_IN_FLIGHT).then_some(n + 1)
+                    })
+                    .is_err()
+                {
+                    Some(plain(503, "too many requests".into()))
+                } else {
+                    let (links, state) = (links.clone(), state.clone());
+                    std::thread::spawn(move || {
+                        let _slot = WorkerSlot;
+                        let mut body = Vec::new();
+                        let reply = match request
+                            .as_reader()
+                            .take(MAX_BODY as u64 + 1)
+                            .read_to_end(&mut body)
+                        {
+                            Ok(_) => {
+                                respond_remove(true, content_type.as_deref(), &body, &links, &state)
+                            }
+                            Err(e) => plain(400, format!("body not read: {e}")),
+                        };
+                        send_reply(request, reply);
+                    });
+                    continue;
                 }
             }
-            _ => plain(405, "GET, or POST /remove".into()),
+            Method::Post => Some(plain(404, "not found".into())),
+            _ if path == "/remove" => Some(plain(405, "GET, or POST /remove".into())),
+            _ => Some(plain(404, "not found".into())),
         };
-        let mut response = Response::from_string(reply.body).with_status_code(reply.status);
-        for (k, v) in headers
-            .iter()
-            .chain([("Content-Type", reply.content_type)].iter())
-        {
-            if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                response.add_header(h);
-            }
+        if let Some(reply) = reply {
+            send_reply(request, reply);
         }
-        let _ = request.respond(response);
     }
     0
+}
+
+fn is_json(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|c| c.split(';').next())
+        .is_some_and(|c| c.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn send_reply(request: tiny_http::Request, reply: Reply) {
+    let mut response = Response::from_string(reply.body).with_status_code(reply.status);
+    for (name, value) in [
+        (
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+        ),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Cache-Control", "no-store"),
+        ("Content-Type", reply.content_type),
+    ] {
+        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response.add_header(header);
+        }
+    }
+    let _ = request.respond(response);
 }
 
 fn plain(status: u16, body: String) -> Reply {
@@ -272,8 +317,12 @@ fn discover_loop(paths: &Paths) {
     let net = Http::new();
     std::thread::sleep(Duration::from_secs(120));
     loop {
-        if discover::should_run(&options(paths), &paths.state(), epoch()) {
-            discover_once(&net, paths, false);
+        match paths.state() {
+            Ok(state) if discover::should_run(&options(paths), &state, epoch()) => {
+                discover_once(&net, paths, false);
+            }
+            Err(e) => eprintln!("discover: {e}"),
+            Ok(_) => {}
         }
         std::thread::sleep(Duration::from_secs(1800));
     }
@@ -379,7 +428,7 @@ impl Remote {
     fn read(&self) -> Result<Vec<Link>, String> {
         let dir = &self.dir;
         let out = self.run(
-            &format!("{AS_ROOT}; echo __FINDS__; $S cat {dir}/links.json 2>/dev/null || echo '[]'; echo __END__"),
+            &format!("{AS_ROOT}; $S sh -c 'echo __FINDS__; if [ -e {dir}/links.json ]; then cat {dir}/links.json || exit 1; else echo []; fi; echo; echo __END__'"),
             None,
         )?;
         let body = out
@@ -396,14 +445,79 @@ impl Remote {
         Ok(links)
     }
 
-    fn write(&self, links: &[Link]) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(links).map_err(|e| e.to_string())? + "\n";
+    /// The remote shell holds the same lock as the add-on until the new list is renamed.
+    fn edit<T>(
+        &self,
+        change: impl FnOnce(&mut Vec<Link>) -> Result<T, String>,
+    ) -> Result<T, String> {
         let dir = &self.dir;
-        self.run(
-            &format!("{AS_ROOT}; $S sh -c 'mkdir -p {dir} && cat > {dir}/.links.tmp && chmod 644 {dir}/.links.tmp && mv {dir}/.links.tmp {dir}/links.json'"),
-            Some(json.as_bytes()),
-        )
-        .map(|_| ())
+        let script = format!(
+            "mkdir -p {dir} && exec 9>{dir}/.finds.lock && flock -x 9 && \
+             echo __FINDS__ && if [ -e {dir}/links.json ]; then cat {dir}/links.json || exit 1; \
+             else echo []; fi && echo && echo __END__ && \
+             IFS= read -r action && [ \"$action\" = COMMIT ] || exit 1; \
+             tmp=$(mktemp {dir}/.links.XXXXXXXX) || exit 1; \
+             cat > \"$tmp\" && chmod 644 \"$tmp\" && mv \"$tmp\" {dir}/links.json"
+        );
+        let mut ssh = Command::new("ssh");
+        if let Some(key) = &self.key {
+            ssh.args(["-i", key]);
+        }
+        let mut child = ssh
+            .args([
+                "-p",
+                &self.port,
+                "-o",
+                "BatchMode=yes",
+                &self.host,
+                &format!("{AS_ROOT}; $S sh -c '{script}'"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("ssh: {e}"))?;
+        let mut output = BufReader::new(child.stdout.take().ok_or("no ssh stdout")?);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if output.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                return Err("no marked output from the host".into());
+            }
+            if line.trim_end() == "__FINDS__" {
+                break;
+            }
+        }
+        let mut body = String::new();
+        loop {
+            line.clear();
+            if output.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                return Err("incomplete links file from the host".into());
+            }
+            if line.trim_end() == "__END__" {
+                break;
+            }
+            body.push_str(&line);
+        }
+        let (mut links, notes) = parse(&body);
+        if !notes.is_empty() {
+            return Err(format!(
+                "the file on the host has entries this tool would drop: {notes:?}"
+            ));
+        }
+        let result = change(&mut links)?;
+        let json = serde_json::to_string_pretty(&links).map_err(|e| e.to_string())? + "\n";
+        let mut input = child.stdin.take().ok_or("no ssh stdin")?;
+        input.write_all(b"COMMIT\n").map_err(|e| e.to_string())?;
+        input
+            .write_all(json.as_bytes())
+            .map_err(|e| e.to_string())?;
+        drop(input);
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!("ssh exited {status}"));
+        }
+        Ok(result)
     }
 }
 
@@ -464,9 +578,10 @@ fn add(args: &[String]) -> i32 {
         return 2;
     }
     let result = remote(args).and_then(|remote| {
-        let mut links = remote.read()?;
-        let replaced = upsert(&mut links, link.clone());
-        remote.write(&links).map(|()| (replaced, links.len()))
+        remote.edit(|links| {
+            let replaced = upsert(links, link.clone());
+            Ok((replaced, links.len()))
+        })
     });
     match result {
         Ok((replaced, n)) => {
@@ -506,11 +621,12 @@ fn remove(args: &[String]) -> i32 {
         return 2;
     };
     let result = remote(args).and_then(|remote| {
-        let mut links = remote.read()?;
-        if !remove_url(&mut links, &url) {
-            return Err(format!("no link {url}"));
-        }
-        remote.write(&links).map(|()| links.len())
+        remote.edit(|links| {
+            if !remove_url(links, &url) {
+                return Err(format!("no link {url}"));
+            }
+            Ok(links.len())
+        })
     });
     match result {
         Ok(n) => {

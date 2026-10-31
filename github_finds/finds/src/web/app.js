@@ -6,6 +6,7 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* private window */ } },
 };
 const state = { links: [], tag: null, text: "", leftOut: 0, discovery: "", canRemove: false };
+const deletes = new Map();
 // Links this browser has already shown; the first visit marks nothing new.
 let seen = null;
 try { seen = new Set(JSON.parse(store.get("finds.seen") || "null")); } catch { seen = null; }
@@ -53,38 +54,42 @@ function foot(error) {
 function trash(l) {
   const b = el("button", "trash");
   b.type = "button";
-  let timer = null;
-  const disarm = () => {
-    clearTimeout(timer);
-    timer = null;
-    b.classList.remove("armed");
-    b.replaceChildren(trashIcon());
-    b.setAttribute("aria-label", "Delete " + l.title);
-    b.title = "Delete";
-    b.disabled = false;
-  };
-  disarm();
+  const deleting = deletes.get(l.url);
+  const armed = deleting && deleting.until > Date.now();
+  if (armed) b.classList.add("armed");
+  b.replaceChildren(trashIcon(), ...(armed ? [el("span", "", "Delete?")] : []));
+  b.setAttribute("aria-label", "Delete " + l.title + (armed ? "? Press again to confirm" : ""));
+  b.title = armed ? "Delete?" : "Delete";
+  b.disabled = deleting?.pending === true;
   b.addEventListener("click", () => {
-    if (!timer) {
-      b.classList.add("armed");
-      b.replaceChildren(trashIcon(), el("span", "", "Delete?"));
-      b.setAttribute("aria-label", "Delete " + l.title + "? Press again to confirm");
-      b.title = "Delete?";
-      timer = setTimeout(disarm, 4000);
+    const current = deletes.get(l.url);
+    if (current?.pending) return;
+    if (!current || current.until <= Date.now()) {
+      const entry = { until: Date.now() + 4000, pending: false };
+      deletes.set(l.url, entry);
+      setTimeout(() => {
+        if (deletes.get(l.url) === entry && !entry.pending) {
+          deletes.delete(l.url);
+          render();
+        }
+      }, 4000);
+      render();
       return;
     }
-    clearTimeout(timer);
-    b.disabled = true;
+    current.pending = true;
+    render();
     fetch("remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: l.url }) })
       .then((r) => {
         if (!r.ok) throw new Error(String(r.status));
+        deletes.delete(l.url);
         state.links = state.links.filter((x) => x.url !== l.url);
         if (state.tag && !state.links.some((x) => (x.tags || []).includes(state.tag))) state.tag = null;
         foot();
         render();
       })
       .catch((e) => {
-        disarm();
+        deletes.delete(l.url);
+        render();
         foot("Could not delete: " + (/^\d+$/.test(e.message) ? e.message : "no answer"));
       });
   });

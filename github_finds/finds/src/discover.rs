@@ -3,8 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -723,21 +725,23 @@ impl Paths {
         }
     }
 
-    /// The saved state; missing or unreadable starts afresh.
-    pub fn state(&self) -> State {
-        std::fs::read_to_string(&self.state)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+    /// The saved state; only a missing file starts afresh.
+    pub fn state(&self) -> Result<State, String> {
+        read_state(&self.state)
     }
 }
 
-/// Held for every read-modify-write of the links file or the state file, by a run's save and by a
-/// delete from the page.
-static FILES: Mutex<()> = Mutex::new(());
-
-fn files() -> MutexGuard<'static, ()> {
-    FILES.lock().unwrap_or_else(PoisonError::into_inner)
+/// All writers use the lock beside links.json, including the SSH CLI on the host.
+fn files(links_path: &str) -> std::io::Result<File> {
+    let lock = Path::new(links_path).with_file_name(".finds.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock)?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Why a find was not deleted.
@@ -758,10 +762,18 @@ fn read_if_there(path: &str) -> Result<Option<String>, Dismiss> {
     }
 }
 
+fn read_state(path: &str) -> Result<State, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{path}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
 /// Delete the find with this url from the list and record it in the state, so discovery never
 /// adds it again; the number of finds left.
 pub fn dismiss(links_path: &str, state_path: &str, url: &str) -> Result<usize, Dismiss> {
-    let _held = files();
+    let _held = files(links_path).map_err(|e| Dismiss::Failed(e.to_string()))?;
     let text = read_if_there(links_path)?;
     let (mut links, notes) = text.as_deref().map(parse).unwrap_or_default();
     if !notes.is_empty() {
@@ -773,12 +785,7 @@ pub fn dismiss(links_path: &str, state_path: &str, url: &str) -> Result<usize, D
         return Err(Dismiss::NotListed);
     }
     // A state file that does not parse is refused rather than replaced, so its history stays.
-    let mut state: State = match read_if_there(state_path)? {
-        Some(t) => {
-            serde_json::from_str(&t).map_err(|e| Dismiss::Failed(format!("{state_path}: {e}")))?
-        }
-        None => State::default(),
-    };
+    let mut state = read_state(state_path).map_err(Dismiss::Failed)?;
     state.dismissed.insert(url.to_lowercase());
     // The dismissal is saved first: a failed list write leaves the find shown, still kept out.
     let failed = |path: &str, e: String| Dismiss::Failed(format!("{path} not written: {e}"));
@@ -794,9 +801,29 @@ pub fn dismiss(links_path: &str, state_path: &str, url: &str) -> Result<usize, D
 
 /// Write `text` to `path` through a temporary file beside it.
 pub fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, Path::new(path))
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = loop {
+        let name = format!(
+            "{path}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        match OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(file) => break (name, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let (name, mut file) = tmp;
+    let result = (|| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&name, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&name);
+    }
+    result
 }
 
 /// One run against the files: search, judge, merge the picks into the list, save the state. A dry
@@ -808,8 +835,8 @@ pub fn once(
     dry: bool,
     now: u64,
 ) -> Result<Run, String> {
-    let mut state = paths.state();
-    let text = std::fs::read_to_string(&paths.links).ok();
+    let mut state = paths.state()?;
+    let text = read_if_there(&paths.links).map_err(|e| format!("{e:?}"))?;
     let (links, notes) = text.as_deref().map(parse).unwrap_or_default();
     if !notes.is_empty() {
         return Err(format!(
@@ -821,9 +848,10 @@ pub fn once(
     if dry {
         return Ok(outcome);
     }
-    let _held = files();
+    let _held = files(&paths.links).map_err(|e| e.to_string())?;
     // A find deleted from the page while the run searched stays deleted and dismissed.
-    let dismissed = paths.state().dismissed;
+    let current_state = paths.state()?;
+    let dismissed = current_state.dismissed;
     outcome
         .picks
         .retain(|l| !dismissed.contains(&l.url.to_lowercase()));
@@ -833,9 +861,12 @@ pub fn once(
         .added
         .retain(|t| kept.iter().any(|l| &l.title == t));
     state.dismissed.extend(dismissed);
+    state.seen.extend(current_state.seen);
+    state.picked.extend(current_state.picked);
+    state.last_run = state.last_run.max(current_state.last_run);
     if !outcome.picks.is_empty() {
         // Read again: the CLI may have changed the file during the run.
-        let current = std::fs::read_to_string(&paths.links).ok();
+        let current = read_if_there(&paths.links).map_err(|e| format!("{e:?}"))?;
         merge(current.as_deref(), &outcome.picks)
             .and_then(|t| write_atomic(&paths.links, &t).map_err(|e| e.to_string()))
             .map_err(|e| format!("{} not written, state kept as it was: {e}", paths.links))?;
@@ -863,6 +894,7 @@ mod tests {
     use super::*;
     use crate::GITHUB;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     const NOW: u64 = 20_743 * DAY + 3_600; // 2026-10-17 01:00 UTC
 
@@ -1551,6 +1583,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn lock_holder() {
+        let Some(dir) = std::env::var_os("FINDS_LOCK_TEST_DIR") else {
+            return;
+        };
+        let dir = Path::new(&dir);
+        let links = dir.join("links.json");
+        let _held = files(links.to_str().unwrap()).unwrap();
+        std::fs::write(dir.join("ready"), "ready").unwrap();
+        for _ in 0..300 {
+            if dir.join("release").exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("lock holder was not released");
+    }
+
+    #[test]
+    fn separate_processes_serialize_the_links_transaction() {
+        let p = scratch("process-lock");
+        let dir = Path::new(&p.links).parent().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "discover::tests::lock_holder"])
+            .env("FINDS_LOCK_TEST_DIR", dir)
+            .spawn()
+            .unwrap();
+        for _ in 0..300 {
+            if dir.join("ready").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.join("ready").exists());
+        let links = p.links.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _held = files(&links).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        std::fs::write(dir.join("release"), "release").unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.join().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn atomic_write_uses_a_unique_temporary_file() {
+        let p = scratch("unique-temp");
+        std::fs::create_dir_all(format!("{}.tmp", p.links)).unwrap();
+        write_atomic(&p.links, "[]").unwrap();
+        assert_eq!(std::fs::read_to_string(&p.links).unwrap(), "[]");
+    }
+
+    #[test]
     fn once_merges_picks_saves_state_and_a_second_run_skips_them() {
         let p = scratch("once");
         std::fs::write(
@@ -1570,7 +1658,7 @@ mod tests {
             links.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
             ["n/new", "o/old"]
         );
-        let state = p.state();
+        let state = p.state().unwrap();
         assert_eq!(state.last_run, NOW);
         assert!(state.picked.contains_key("https://github.com/n/new"));
         assert!(!Path::new(&format!("{}.tmp", p.links)).exists());
@@ -1623,7 +1711,7 @@ mod tests {
             listed.iter().map(|l| l.title.as_str()).collect::<Vec<_>>(),
             ["t/two"]
         );
-        let saved = p.state();
+        let saved = p.state().unwrap();
         assert!(saved.dismissed.contains("https://github.com/n/new"));
         assert!(saved.dismissed.contains("https://github.com/o/old"));
         assert_eq!(saved.last_run, NOW);
@@ -1679,9 +1767,46 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_state_stops_discovery_before_search_or_write() {
+        let p = scratch("damaged-state");
+        std::fs::write(&p.state, "not json").unwrap();
+        let net = Fake::new().topic("mcp", vec![repo("n/new", 5)]);
+        assert!(once(&net, &opts(&["mcp"], 3), &p, false, NOW).is_err());
+        assert!(net.queries.borrow().is_empty());
+        assert_eq!(std::fs::read_to_string(&p.state).unwrap(), "not json");
+        assert!(!Path::new(&p.links).exists());
+    }
+
+    #[test]
+    fn an_unreadable_state_stops_discovery_before_search_or_write() {
+        let p = scratch("unreadable-state");
+        std::fs::create_dir_all(&p.state).unwrap();
+        let net = Fake::new().topic("mcp", vec![repo("n/new", 5)]);
+        assert!(once(&net, &opts(&["mcp"], 3), &p, false, NOW).is_err());
+        assert!(net.queries.borrow().is_empty());
+        assert!(Path::new(&p.state).is_dir());
+        assert!(!Path::new(&p.links).exists());
+    }
+
+    #[test]
+    fn state_damaged_during_search_stops_before_publishing_links() {
+        let p = scratch("state-damaged-during");
+        let state_path = p.state.clone();
+        let mut net = Fake::new()
+            .topic("mcp", vec![repo("n/new", 5)])
+            .says("n/new", Ok(answer(true, 9, "Useful")));
+        net.during = Some(Box::new(move || {
+            std::fs::write(&state_path, "not json").unwrap();
+        }));
+        assert!(once(&net, &opts(&["mcp"], 3), &p, false, NOW).is_err());
+        assert_eq!(std::fs::read_to_string(&p.state).unwrap(), "not json");
+        assert!(!Path::new(&p.links).exists());
+    }
+
+    #[test]
     fn a_list_that_cannot_be_written_keeps_the_old_state() {
         let p = scratch("unwritable");
-        std::fs::create_dir_all(format!("{}.tmp", p.links)).unwrap();
+        std::fs::create_dir_all(&p.links).unwrap();
         let net = Fake::new()
             .topic("mcp", vec![repo("n/new", 5)])
             .says("n/new", Ok(answer(true, 9, "Useful")));
@@ -1692,23 +1817,23 @@ mod tests {
         let r = once(&none, &opts(&["mcp"], 3), &q, false, NOW).unwrap();
         assert!(r.picks.is_empty());
         assert!(!Path::new(&q.links).exists(), "no picks, no list written");
-        assert_eq!(q.state().last_run, NOW);
+        assert_eq!(q.state().unwrap().last_run, NOW);
     }
 
     #[test]
     fn options_and_state_files() {
         let p = scratch("files");
         assert_eq!(p.options(), Ok(Options::default()));
-        assert_eq!(p.state(), State::default());
+        assert_eq!(p.state(), Ok(State::default()));
         std::fs::write(&p.options, r#"{"per_day": 1, "discover": false}"#).unwrap();
         let o = p.options().unwrap();
         assert_eq!((o.per_day, o.discover), (1, false));
         std::fs::write(&p.options, "not json").unwrap();
         assert!(p.options().is_err());
         std::fs::write(&p.state, "not json").unwrap();
-        assert_eq!(p.state(), State::default());
+        assert!(p.state().is_err());
         std::fs::write(&p.state, r#"{"last_run": 5}"#).unwrap();
-        assert_eq!(p.state().last_run, 5);
+        assert_eq!(p.state().unwrap().last_run, 5);
         let dir = scratch("dir");
         std::fs::create_dir_all(&dir.options).unwrap();
         assert!(
