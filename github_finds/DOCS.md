@@ -40,7 +40,7 @@ Once a day the add-on searches GitHub, one search per topic, and adds up to `per
 | Pick, with a router | Up to 40 candidates a run, each sent to the model with a brief built from `interests` (or the topics), the finds you added yourself with their reasons, and the discovered finds you removed. The model answers pick, score 0 to 10 and why; picks scoring 7 or more are kept, best score first, then stars, and the model's reason is shown. |
 | Add | Up to `per_day`, one per owner. Tags are the project's topics that match a search topic or a tag already in the list, up to four, filled to two from its other topics. A pick past the quota or a second from one owner waits for the next day. |
 
-The first check runs two minutes after start, then every 30 minutes; a run starts when a day has passed since the last finished one. A run that could not reach the router, or whose every search failed, does not count as finished, so the next check tries again. Each run logs one line: who judged, searches, candidates, verdicts, picks, deferred, and the names added. State lives in `/data/discover.json` inside the add-on.
+The first check runs two minutes after start, then every 30 minutes; a run starts when a day has passed since the last finished one. A run that could not reach the router, or whose every search failed, does not count as finished, so the next check tries again. Each run logs one line: who judged, searches, candidates, verdicts, picks, deferred, and the names added. State lives in `/data/discover.json` inside the add-on. If that file cannot be read or does not parse, the run stops, logs why and leaves the file as it was; only a missing file starts afresh.
 
 ### A model router
 

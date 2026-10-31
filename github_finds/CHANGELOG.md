@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- A damaged or unreadable state file stops discovery and is left as it was, so a bad read can no longer forget the finds you deleted. Only a missing file starts empty.
+- The page, a discovery run and the command line take a file lock for each change to the links and state files, and each write replaces the file whole.
+- A slow or stalled delete request no longer holds up the page or the health check.
+- A card's trashcan stays armed when you type in the filter or change tags.
+
 ## 0.4.0
 
 - Each card in the sidebar panel has a trashcan in its bottom-right corner: the first press arms it, a second within 4 s deletes the find from the list and keeps discovery from suggesting it again. The LAN port stays read-only and shows no trashcan.
