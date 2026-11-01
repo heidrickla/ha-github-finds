@@ -4,7 +4,9 @@ A Home Assistant add-on that finds new GitHub projects for your setup once a day
 
 ## Screenshots
 
-![The Finds page with four project cards, tag buttons and a filter box](docs/images/finds.png)
+![GitHub Finds dashboard with an example six-project reading list](docs/images/finds.png)
+
+The screenshot uses illustrative project notes in a local read-only `serve` session. [See a filtered view](docs/images/finds-filtered.png) and [the phone layout](docs/images/finds-mobile.png).
 
 Each card shows why the project was picked, its description, language, stars, last push and tags. In the sidebar a trashcan in each card's corner deletes a find you no longer want, and discovery does not suggest it again.
 

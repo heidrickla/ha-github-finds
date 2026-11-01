@@ -127,6 +127,9 @@ function render() {
   const shown = state.links.filter((l) =>
     (!state.tag || (l.tags || []).includes(state.tag)) &&
     (!q || [l.title, l.why, l.summary || "", (l.tags || []).join(" ")].join(" ").toLowerCase().includes(q)));
+  document.getElementById("shown-count").textContent = String(shown.length);
+  document.getElementById("total-count").textContent = state.tag || state.text
+    ? `of ${state.links.length} finds shown` : `finds in your list`;
   list.replaceChildren(...(shown.length ? shown.map(card) : [el("p", "empty", state.links.length ? "Nothing matches." : "No finds yet.")]));
   const tags = document.getElementById("tags");
   const all = [...new Set(state.links.flatMap((l) => l.tags || []))].sort();

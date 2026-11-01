@@ -17,7 +17,7 @@ test("armed delete survives filter and tag rerenders and sends once", async () =
     };
     return node;
   }
-  for (const id of ["theme", "foot", "list", "tags", "filter"]) elements.set(id, element("div"));
+  for (const id of ["theme", "foot", "list", "tags", "filter", "shown-count", "total-count"]) elements.set(id, element("div"));
   const document = {
     documentElement: element("html"),
     getElementById(id) { return elements.get(id); },
@@ -41,6 +41,8 @@ test("armed delete survives filter and tag rerenders and sends once", async () =
   });
   vm.runInContext(fs.readFileSync(require("node:path").join(__dirname, "app.js"), "utf8"), context);
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements.get("shown-count").textContent, "1");
+  assert.equal(elements.get("total-count").textContent, "finds in your list");
   const button = () => elements.get("list").children[0].children.at(-1);
   button().listeners.click();
   elements.get("filter").listeners.input({ target: { value: "o/r" } });
@@ -54,4 +56,5 @@ test("armed delete survives filter and tag rerenders and sends once", async () =
   finishRemove({ ok: true });
   await Promise.resolve();
   assert.equal(elements.get("list").children[0].className, "empty");
+  assert.equal(elements.get("shown-count").textContent, "0");
 });

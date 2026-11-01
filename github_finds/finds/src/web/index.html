@@ -8,12 +8,18 @@
 </head>
 <body>
 <header>
-  <div class="brand"><h1>GitHub Finds</h1><span class="tagline">projects picked for you</span></div>
+  <div class="brand"><span class="brandmark" aria-hidden="true">GF</span><strong>GitHub Finds</strong></div>
   <div class="controls">
     <input id="filter" type="search" placeholder="Filter" autocomplete="off" aria-label="Filter">
     <button id="theme" type="button" aria-label="Toggle theme">Light</button>
   </div>
 </header>
+<section class="hero" aria-label="Finds overview">
+  <div><p class="eyebrow">CURATED DISCOVERY</p><h1>Projects worth a closer look.</h1>
+    <p class="tagline">A focused reading list of GitHub projects picked for you.</p></div>
+  <div class="count"><strong id="shown-count">—</strong><span id="total-count">finds</span></div>
+</section>
+<div class="section-label"><h2>Explore finds</h2><span>Filter by topic or search above</span></div>
 <nav id="tags" aria-label="Tags"></nav>
 <main id="list" aria-live="polite"></main>
 <footer id="foot"></footer>
