@@ -4,18 +4,25 @@
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::extract::{ConnectInfo, State};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{Method, Request, Response};
 use github_finds::discover::{self, Fetch, Net, Options, Paths};
 use github_finds::{
     GITHUB, INGRESS, Link, MAX_BODY, Reply, date_from_days, from_repo, from_trusted, owner_repo,
     parse, refuse, remove as remove_url, respond, respond_remove, upsert,
 };
 use serde_json::Value;
-use tiny_http::{Header, Method, Response, Server};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 const USAGE: &str = "usage:
   github-finds serve [--links /config/links.json] [--port 8091] [--options /data/options.json] [--state /data/discover.json] [--trusted 172.30.32.2]
@@ -30,14 +37,14 @@ const DIR: &str = "/addon_configs/75df1782_github_finds";
 /// Discovery's state, and the dismissed finds, inside the add-on.
 const STATE: &str = "/data/discover.json";
 const MAX_IN_FLIGHT: usize = 16;
-static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const BODY_TIMEOUT: Duration = Duration::from_secs(3);
 
-struct WorkerSlot;
-
-impl Drop for WorkerSlot {
-    fn drop(&mut self) {
-        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-    }
+struct ServeState {
+    links: String,
+    state: String,
+    trusted: IpAddr,
+    discovery: String,
+    body_slots: Arc<Semaphore>,
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -74,8 +81,20 @@ fn serve(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let server = match Server::http(format!("0.0.0.0:{port}")) {
-        Ok(s) => s,
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(MAX_IN_FLIGHT)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("cannot start HTTP runtime: {e}");
+            return 1;
+        }
+    };
+    let listener = match runtime.block_on(TcpListener::bind(format!("0.0.0.0:{port}"))) {
+        Ok(listener) => listener,
         Err(e) => {
             eprintln!("cannot listen on {port}: {e}");
             return 1;
@@ -98,63 +117,91 @@ fn serve(args: &[String]) -> i32 {
         None => "Daily discovery is off.".to_string(),
     };
     eprintln!("{discovery}");
-    for mut request in server.incoming_requests() {
-        let from = from_trusted(request.remote_addr().map(|a| a.ip()), trusted);
-        let path = request.url().split('?').next().unwrap_or("");
-        let reply = match request.method() {
-            Method::Get | Method::Head => {
-                let file = std::fs::read_to_string(&links).ok();
-                Some(respond(request.url(), file.as_deref(), &discovery, from))
-            }
-            Method::Post if path == "/remove" => {
-                let content_type = request
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("Content-Type"))
-                    .map(|h| h.value.as_str().to_string());
-                if !from {
-                    Some(plain(
-                        403,
-                        "finds are deleted only through Home Assistant".into(),
-                    ))
-                } else if !is_json(content_type.as_deref()) {
-                    Some(plain(415, "Content-Type must be application/json".into()))
-                } else if IN_FLIGHT
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < MAX_IN_FLIGHT).then_some(n + 1)
-                    })
-                    .is_err()
-                {
-                    Some(plain(503, "too many requests".into()))
-                } else {
-                    let (links, state) = (links.clone(), state.clone());
-                    std::thread::spawn(move || {
-                        let _slot = WorkerSlot;
-                        let mut body = Vec::new();
-                        let reply = match request
-                            .as_reader()
-                            .take(MAX_BODY as u64 + 1)
-                            .read_to_end(&mut body)
-                        {
-                            Ok(_) => {
-                                respond_remove(true, content_type.as_deref(), &body, &links, &state)
-                            }
-                            Err(e) => plain(400, format!("body not read: {e}")),
-                        };
-                        send_reply(request, reply);
-                    });
-                    continue;
-                }
-            }
-            Method::Post => Some(plain(404, "not found".into())),
-            _ if path == "/remove" => Some(plain(405, "GET, or POST /remove".into())),
-            _ => Some(plain(404, "not found".into())),
-        };
-        if let Some(reply) = reply {
-            send_reply(request, reply);
-        }
+    let shared = Arc::new(ServeState {
+        links,
+        state,
+        trusted,
+        discovery,
+        body_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+    });
+    let app = Router::new().fallback(handle_request).with_state(shared);
+    if let Err(e) = runtime.block_on(async {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    }) {
+        eprintln!("HTTP server stopped: {e}");
+        return 1;
     }
     0
+}
+
+async fn handle_request(
+    State(shared): State<Arc<ServeState>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let from = from_trusted(Some(remote.ip()), shared.trusted);
+    let path = request.uri().path();
+    let head = request.method() == Method::HEAD;
+    let reply = match (request.method(), path) {
+        (&Method::GET | &Method::HEAD, _) => {
+            let file = std::fs::read_to_string(&shared.links).ok();
+            let url = request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or(path);
+            respond(url, file.as_deref(), &shared.discovery, from)
+        }
+        (&Method::POST, "/remove") => {
+            let content_type = request
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            if !from {
+                plain(403, "finds are deleted only through Home Assistant".into())
+            } else if !is_json(content_type.as_deref()) {
+                plain(415, "Content-Type must be application/json".into())
+            } else {
+                let Ok(_permit) = shared.body_slots.clone().try_acquire_owned() else {
+                    return reply_response(plain(503, "too many requests".into()), false);
+                };
+                // Async body reads leave the health route free, even when a client stops sending.
+                let body = match timeout(BODY_TIMEOUT, to_bytes(request.into_body(), MAX_BODY))
+                    .await
+                {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(e)) => {
+                        return reply_response(plain(400, format!("body not read: {e}")), false);
+                    }
+                    Err(_) => {
+                        return reply_response(plain(408, "body read timed out".into()), false);
+                    }
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    respond_remove(
+                        true,
+                        content_type.as_deref(),
+                        &body,
+                        &shared.links,
+                        &shared.state,
+                    )
+                })
+                .await;
+                return reply_response(
+                    result.unwrap_or_else(|e| plain(500, format!("request failed: {e}"))),
+                    false,
+                );
+            }
+        }
+        (_, "/remove") => plain(405, "GET, or POST /remove".into()),
+        _ => plain(404, "not found".into()),
+    };
+    reply_response(reply, head)
 }
 
 fn is_json(content_type: Option<&str>) -> bool {
@@ -163,23 +210,25 @@ fn is_json(content_type: Option<&str>) -> bool {
         .is_some_and(|c| c.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn send_reply(request: tiny_http::Request, reply: Reply) {
-    let mut response = Response::from_string(reply.body).with_status_code(reply.status);
-    for (name, value) in [
-        (
+fn reply_response(reply: Reply, head: bool) -> Response<Body> {
+    let content_length = reply.body.len();
+    Response::builder()
+        .status(reply.status)
+        .header(
             "Content-Security-Policy",
             "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
-        ),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Referrer-Policy", "no-referrer"),
-        ("Cache-Control", "no-store"),
-        ("Content-Type", reply.content_type),
-    ] {
-        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response.add_header(header);
-        }
-    }
-    let _ = request.respond(response);
+        )
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Referrer-Policy", "no-referrer")
+        .header("Cache-Control", "no-store")
+        .header("Content-Type", reply.content_type)
+        .header("Content-Length", content_length)
+        .body(if head {
+            Body::empty()
+        } else {
+            Body::from(reply.body)
+        })
+        .expect("valid static response headers")
 }
 
 fn plain(status: u16, body: String) -> Reply {
